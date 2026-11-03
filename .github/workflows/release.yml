@@ -51,7 +51,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build pkg-config llvm-18 desktop-file-utils dbus \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libxss-dev libxfixes-dev libxkbcommon-dev libwayland-dev \
+            libxss-dev libxfixes-dev libxtst-dev libxkbcommon-dev libwayland-dev \
             wayland-protocols libegl-dev libgl-dev libdecor-0-dev libdbus-1-dev
           curl -fsSL "https://raw.githubusercontent.com/${GOSSAMER_REPO}/main/scripts/install.sh" | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
