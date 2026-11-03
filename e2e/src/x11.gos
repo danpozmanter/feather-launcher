@@ -1,0 +1,360 @@
+// An X11 client that watches and drives the launcher's windows: window
+// properties, focus, synthetic keys through XSendEvent and XTest, and key
+// grab probes. libX11 and libXtst are opened at run time, so the checks that
+// need no display also run where neither is installed.
+use std::{errors, ffi}
+use std::ffi::Ptr
+use support
+
+pub const XK_TAB: u64 = 0xff09
+pub const XK_RETURN: u64 = 0xff0d
+pub const XK_ESCAPE: u64 = 0xff1b
+pub const XK_HOME: u64 = 0xff50
+const XK_Q: u64 = 0x71
+const XK_SHIFT_L: u64 = 0xffe1
+const XK_CONTROL_L: u64 = 0xffe3
+
+/// The Control modifier bit of a key event or grab.
+pub const CONTROL_MASK: u32 = 1 << 2
+
+const KEY_PRESS: ffi::c_int = 2
+const KEY_PRESS_MASK: ffi::c_long = 1
+const REVERT_TO_PARENT: ffi::c_int = 2
+const IS_VIEWABLE: i32 = 2
+const GRAB_MODE_ASYNC: ffi::c_int = 1
+const RTLD_NOW: ffi::c_int = 2
+// XWindowAttributes is 136 bytes on LP64, with `map_state` at byte 92.
+const ATTRIBUTE_INTS: i64 = 34
+const MAP_STATE_INT: i64 = 23
+
+// XKeyEvent, padded to the full 192-byte XEvent union.
+#[repr(C)]
+struct KeyEvent {
+    kind: ffi::c_int
+    serial: ffi::c_ulong
+    send_event: ffi::c_int
+    display: usize
+    window: ffi::c_ulong
+    root: ffi::c_ulong
+    subwindow: ffi::c_ulong
+    time: ffi::c_ulong
+    x: ffi::c_int
+    y: ffi::c_int
+    x_root: ffi::c_int
+    y_root: ffi::c_int
+    state: ffi::c_uint
+    keycode: ffi::c_uint
+    same_screen: ffi::c_int
+    pad: [ffi::c_ulong; 12]
+}
+
+unsafe extern "C" {
+    type Display
+    type XErrorEvent
+}
+
+#[link(name = "dl")]
+unsafe extern "C" {
+    type Library
+    fn dlopen(name: [u8], flags: ffi::c_int) -> Option<Ptr<Library>>
+    fn dlsym(handle: Ptr<Library>, name: [u8]) -> Option<Ptr<ffi::c_void>>
+}
+
+struct Xlib {
+    open_display: Fn(Option<Ptr<u8>>) -> Option<Ptr<Display>>
+    default_root_window: Fn(Ptr<Display>) -> ffi::c_ulong
+    intern_atom: Fn(Ptr<Display>, Ptr<u8>, ffi::c_int) -> ffi::c_ulong
+    get_window_property: Fn(Ptr<Display>, ffi::c_ulong, ffi::c_ulong, ffi::c_long, ffi::c_long, ffi::c_int, ffi::c_ulong, Ptr<ffi::c_ulong>, Ptr<ffi::c_int>, Ptr<ffi::c_ulong>, Ptr<ffi::c_ulong>, Ptr<usize>) -> ffi::c_int
+    get_window_attributes: Fn(Ptr<Display>, ffi::c_ulong, Ptr<i32>) -> ffi::c_int
+    free: Fn(Ptr<ffi::c_void>) -> ffi::c_int
+    get_input_focus: Fn(Ptr<Display>, Ptr<ffi::c_ulong>, Ptr<ffi::c_int>) -> ffi::c_int
+    create_simple_window: Fn(Ptr<Display>, ffi::c_ulong, ffi::c_int, ffi::c_int, ffi::c_uint, ffi::c_uint, ffi::c_uint, ffi::c_ulong, ffi::c_ulong) -> ffi::c_ulong
+    store_name: Fn(Ptr<Display>, ffi::c_ulong, Ptr<u8>) -> ffi::c_int
+    map_raised: Fn(Ptr<Display>, ffi::c_ulong) -> ffi::c_int
+    set_input_focus: Fn(Ptr<Display>, ffi::c_ulong, ffi::c_int, ffi::c_ulong) -> ffi::c_int
+    sync: Fn(Ptr<Display>, ffi::c_int) -> ffi::c_int
+    keysym_to_keycode: Fn(Ptr<Display>, ffi::c_ulong) -> ffi::c_uchar
+    send_event: Fn(Ptr<Display>, ffi::c_ulong, ffi::c_int, ffi::c_long, Ptr<KeyEvent>) -> ffi::c_int
+    destroy_window: Fn(Ptr<Display>, ffi::c_ulong) -> ffi::c_int
+    close_display: Fn(Ptr<Display>) -> ffi::c_int
+    grab_key: Fn(Ptr<Display>, ffi::c_int, ffi::c_uint, ffi::c_ulong, ffi::c_int, ffi::c_int, ffi::c_int) -> ffi::c_int
+    ungrab_key: Fn(Ptr<Display>, ffi::c_int, ffi::c_uint, ffi::c_ulong) -> ffi::c_int
+    set_error_handler: Fn(usize) -> usize
+    fake_key_event: Fn(Ptr<Display>, ffi::c_uint, ffi::c_int, ffi::c_ulong) -> ffi::c_int
+}
+
+fn library(name: String) -> Result<Ptr<Library>, errors::Error> {
+    let path = ffi::cstring(name)?
+    let Some(lib) = unsafe { dlopen(path, RTLD_NOW) } else { return Err(errors::new(f"{name} is required")) }
+    Ok(lib)
+}
+
+fn symbol(lib: Ptr<Library>, name: String) -> Result<Ptr<ffi::c_void>, errors::Error> {
+    let Some(found) = unsafe { dlsym(lib, ffi::cstring(name)?) } else { return Err(errors::new(f"{name} is missing")) }
+    Ok(found)
+}
+
+fn xlib() -> Result<Xlib, errors::Error> {
+    let x = library("libX11.so.6")?
+    let xtest = library("libXtst.so.6")?
+    // Each signature matches the C prototype of the symbol it is read from.
+    unsafe {
+        Ok(Xlib {
+            open_display: ffi::fn_from_ptr::<Fn(Option<Ptr<u8>>) -> Option<Ptr<Display>>>(symbol(x, "XOpenDisplay")?)
+            default_root_window: ffi::fn_from_ptr::<Fn(Ptr<Display>) -> ffi::c_ulong>(symbol(x, "XDefaultRootWindow")?)
+            intern_atom: ffi::fn_from_ptr::<Fn(Ptr<Display>, Ptr<u8>, ffi::c_int) -> ffi::c_ulong>(symbol(x, "XInternAtom")?)
+            get_window_property: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_ulong, ffi::c_ulong, ffi::c_long, ffi::c_long, ffi::c_int, ffi::c_ulong, Ptr<ffi::c_ulong>, Ptr<ffi::c_int>, Ptr<ffi::c_ulong>, Ptr<ffi::c_ulong>, Ptr<usize>) -> ffi::c_int>(symbol(x, "XGetWindowProperty")?)
+            get_window_attributes: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_ulong, Ptr<i32>) -> ffi::c_int>(symbol(x, "XGetWindowAttributes")?)
+            free: ffi::fn_from_ptr::<Fn(Ptr<ffi::c_void>) -> ffi::c_int>(symbol(x, "XFree")?)
+            get_input_focus: ffi::fn_from_ptr::<Fn(Ptr<Display>, Ptr<ffi::c_ulong>, Ptr<ffi::c_int>) -> ffi::c_int>(symbol(x, "XGetInputFocus")?)
+            create_simple_window: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_ulong, ffi::c_int, ffi::c_int, ffi::c_uint, ffi::c_uint, ffi::c_uint, ffi::c_ulong, ffi::c_ulong) -> ffi::c_ulong>(symbol(x, "XCreateSimpleWindow")?)
+            store_name: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_ulong, Ptr<u8>) -> ffi::c_int>(symbol(x, "XStoreName")?)
+            map_raised: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_ulong) -> ffi::c_int>(symbol(x, "XMapRaised")?)
+            set_input_focus: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_ulong, ffi::c_int, ffi::c_ulong) -> ffi::c_int>(symbol(x, "XSetInputFocus")?)
+            sync: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_int) -> ffi::c_int>(symbol(x, "XSync")?)
+            keysym_to_keycode: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_ulong) -> ffi::c_uchar>(symbol(x, "XKeysymToKeycode")?)
+            send_event: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_ulong, ffi::c_int, ffi::c_long, Ptr<KeyEvent>) -> ffi::c_int>(symbol(x, "XSendEvent")?)
+            destroy_window: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_ulong) -> ffi::c_int>(symbol(x, "XDestroyWindow")?)
+            close_display: ffi::fn_from_ptr::<Fn(Ptr<Display>) -> ffi::c_int>(symbol(x, "XCloseDisplay")?)
+            grab_key: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_int, ffi::c_uint, ffi::c_ulong, ffi::c_int, ffi::c_int, ffi::c_int) -> ffi::c_int>(symbol(x, "XGrabKey")?)
+            ungrab_key: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_int, ffi::c_uint, ffi::c_ulong) -> ffi::c_int>(symbol(x, "XUngrabKey")?)
+            set_error_handler: ffi::fn_from_ptr::<Fn(usize) -> usize>(symbol(x, "XSetErrorHandler")?)
+            fake_key_event: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_uint, ffi::c_int, ffi::c_ulong) -> ffi::c_int>(symbol(xtest, "XTestFakeKeyEvent")?)
+        })
+    }
+}
+
+// Set by `refuse` while `key_grabbed` holds its probe grab.
+static mut REFUSED: bool = false
+
+fn refuse(display: Ptr<Display>, error: Ptr<XErrorEvent>) -> ffi::c_int {
+    REFUSED = true
+    0
+}
+
+// A NUL-terminated copy of `text` in C memory; the caller frees it.
+fn c_text(text: String) -> Ptr<u8> {
+    let bytes = text.bytes()
+    let out: Ptr<u8> = unsafe { ffi::alloc(bytes.len() + 1) }
+    unsafe {
+        ffi::write_bytes(out, bytes)
+        ffi::write_at(out, bytes.len(), 0 as u8)
+    }
+    out
+}
+
+/// A connection to the X server named by DISPLAY.
+pub struct X11 {
+    lib: Xlib
+    display: Ptr<Display>
+    pub root: u64
+}
+
+/// Connects to the X server.
+pub fn connect() -> Result<X11, errors::Error> {
+    let lib = xlib()?
+    let open = lib.open_display
+    let Some(display) = unsafe { open(None) } else { return Err(errors::new("An X11 display is required")) }
+    let root_of = lib.default_root_window
+    let root = unsafe { root_of(display) }
+    Ok(X11 { lib: lib, display: display, root: root as u64 })
+}
+
+impl X11 {
+    /// The 32-bit items of `window`'s property `name`, empty when unset.
+    pub fn property(&self, window: u64, name: String) -> Vec<u64> {
+        let intern = self.lib.intern_atom
+        let get = self.lib.get_window_property
+        let free = self.lib.free
+        let text = c_text(name)
+        let atom = unsafe { intern(self.display, text, 0) }
+        let kind: Ptr<ffi::c_ulong> = unsafe { ffi::alloc(1) }
+        let size: Ptr<ffi::c_int> = unsafe { ffi::alloc(1) }
+        let count: Ptr<ffi::c_ulong> = unsafe { ffi::alloc(1) }
+        let remaining: Ptr<ffi::c_ulong> = unsafe { ffi::alloc(1) }
+        let data: Ptr<usize> = unsafe { ffi::alloc(1) }
+        unsafe { ffi::write(data, 0 as usize) }
+        let status = unsafe { get(self.display, window as ffi::c_ulong, atom, 0, 4096, 0, 0, kind, size, count, remaining, data) }
+        let mut items = #[]
+        let address = unsafe { ffi::read(data) }
+        if status == 0 && address != 0 {
+            let items_at = unsafe { Ptr::<ffi::c_ulong>::from_address(address as u64) }
+            if let Some(at) = items_at && unsafe { ffi::read(size) } == 32 {
+                let n = unsafe { ffi::read(count) } as i64
+                for i in 0..n {
+                    items.push(unsafe { ffi::read_at(at, i) } as u64)
+                }
+            }
+            if let Some(block) = unsafe { Ptr::<ffi::c_void>::from_address(address as u64) } {
+                let _ = unsafe { free(block) }
+            }
+        }
+        unsafe {
+            ffi::free(text)
+            ffi::free(kind)
+            ffi::free(size)
+            ffi::free(count)
+            ffi::free(remaining)
+            ffi::free(data)
+        }
+        items
+    }
+
+    /// The window holding input focus.
+    pub fn focus(&self) -> u64 {
+        let get = self.lib.get_input_focus
+        let window: Ptr<ffi::c_ulong> = unsafe { ffi::alloc(1) }
+        let revert: Ptr<ffi::c_int> = unsafe { ffi::alloc(1) }
+        unsafe { get(self.display, window, revert) }
+        let focused = unsafe { ffi::read(window) } as u64
+        unsafe { ffi::free(window); ffi::free(revert) }
+        focused
+    }
+
+    /// Whether `window` exists and is mapped and viewable.
+    pub fn viewable(&self, window: u64) -> bool {
+        let get = self.lib.get_window_attributes
+        let attributes: Ptr<i32> = unsafe { ffi::alloc(ATTRIBUTE_INTS) }
+        let ok = unsafe { get(self.display, window as ffi::c_ulong, attributes) } != 0
+        let state = unsafe { ffi::read_at(attributes, MAP_STATE_INT) }
+        unsafe { ffi::free(attributes) }
+        ok && state == IS_VIEWABLE
+    }
+
+    /// The top-level windows the process `pid` owns.
+    pub fn windows_of(&self, pid: i64) -> Vec<u64> {
+        let mut owned = #[]
+        for window in self.property(self.root, "_NET_CLIENT_LIST") {
+            if self.property(window, "_NET_WM_PID") == #[pid as u64] { owned.push(window) }
+        }
+        owned
+    }
+
+    /// The process's one top-level window, once it has one.
+    pub fn wait_window(&self, pid: i64) -> Result<u64, errors::Error> {
+        let mut found = 0 as u64
+        support::wait_for("the launcher's window", || {
+            let owned = self.windows_of(pid)
+            if owned.len() > 0 { found = owned[0] }
+            owned.len() > 0
+        })?
+        Ok(found)
+    }
+
+    /// The keycode the server maps `keysym` to.
+    pub fn keycode(&self, keysym: u64) -> u32 {
+        let to_keycode = self.lib.keysym_to_keycode
+        unsafe { to_keycode(self.display, keysym as ffi::c_ulong) } as u32
+    }
+
+    /// Whether another client holds a passive grab on the key: X11 refuses a
+    /// second grab of the same key and modifiers with BadAccess.
+    pub fn key_grabbed(&self, keysym: u64, modifiers: u32) -> bool {
+        let set_handler = self.lib.set_error_handler
+        let grab = self.lib.grab_key
+        let ungrab = self.lib.ungrab_key
+        REFUSED = false
+        let previous = unsafe { set_handler(ffi::fn_addr(refuse).address() as usize) }
+        let code = self.keycode(keysym) as ffi::c_int
+        unsafe { grab(self.display, code, modifiers as ffi::c_uint, self.root as ffi::c_ulong, 0, GRAB_MODE_ASYNC, GRAB_MODE_ASYNC) }
+        self.sync()
+        let refused = REFUSED
+        if !refused {
+            unsafe { ungrab(self.display, code, modifiers as ffi::c_uint, self.root as ffi::c_ulong) }
+            self.sync()
+        }
+        unsafe { set_handler(previous) }
+        refused
+    }
+
+    /// Waits for every request to reach the server and be answered.
+    pub fn sync(&self) -> () {
+        let sync = self.lib.sync
+        unsafe { sync(self.display, 0) }
+    }
+
+    /// A new 200x80 top-level window titled `title`, not yet mapped.
+    pub fn create_window(&self, title: String) -> u64 {
+        let create = self.lib.create_simple_window
+        let store = self.lib.store_name
+        let window = unsafe { create(self.display, self.root as ffi::c_ulong, 30, 100, 200, 80, 0, 0, 0) }
+        let text = c_text(title)
+        unsafe { store(self.display, window, text); ffi::free(text) }
+        window as u64
+    }
+
+    /// Destroys a window this connection created.
+    pub fn destroy(&self, window: u64) -> () {
+        let destroy = self.lib.destroy_window
+        unsafe { destroy(self.display, window as ffi::c_ulong) }
+        self.sync()
+    }
+
+    /// Gives `window` input focus.
+    pub fn set_focus(&self, window: u64) -> () {
+        let set = self.lib.set_input_focus
+        unsafe { set(self.display, window as ffi::c_ulong, REVERT_TO_PARENT, 0) }
+        self.sync()
+    }
+
+    /// Maps and raises `window`, then gives it input focus.
+    pub fn take_focus(&self, window: u64) -> Result<(), errors::Error> {
+        let map_raised = self.lib.map_raised
+        unsafe { map_raised(self.display, window as ffi::c_ulong) }
+        self.sync()
+        support::wait_for("the competing window to map", || self.viewable(window))?
+        self.set_focus(window)
+        Ok(())
+    }
+
+    /// Sends `window` a key press of `keysym` with `modifiers` held.
+    pub fn key(&self, window: u64, keysym: u64, modifiers: u32 = 0) -> () {
+        let send = self.lib.send_event
+        let event: Ptr<KeyEvent> = unsafe { ffi::alloc(1) }
+        let press = KeyEvent {
+            kind: KEY_PRESS, serial: 0, send_event: 0, display: self.display.address() as usize
+            window: window as ffi::c_ulong, root: self.root as ffi::c_ulong, subwindow: 0, time: 0
+            x: 0, y: 0, x_root: 0, y_root: 0, state: modifiers as ffi::c_uint
+            keycode: self.keycode(keysym) as ffi::c_uint, same_screen: 1, pad: [0; 12]
+        }
+        unsafe {
+            ffi::write(event, press)
+            send(self.display, window as ffi::c_ulong, 0, KEY_PRESS_MASK, event)
+            ffi::free(event)
+        }
+        self.sync()
+    }
+
+    /// Types `keysym` through XTest, as the keyboard would, with Control
+    /// held when `control` is set.
+    pub fn stroke(&self, keysym: u64, control: bool = false) -> () {
+        let modifiers = if control { #[XK_CONTROL_L] } else { #[] }
+        self.chord(modifiers, keysym)
+    }
+
+    /// Presses Ctrl+Shift+Q, Feather's quit shortcut, through XTest.
+    pub fn quit_shortcut(&self) -> () {
+        self.chord(#[XK_CONTROL_L, XK_SHIFT_L], XK_Q)
+    }
+
+    // Presses each modifier, taps `keysym`, then releases them in reverse.
+    fn chord(&self, modifiers: Vec<u64>, keysym: u64) -> () {
+        let fake = self.lib.fake_key_event
+        for held in modifiers {
+            unsafe { fake(self.display, self.keycode(held) as ffi::c_uint, 1, 0) }
+        }
+        let code = self.keycode(keysym) as ffi::c_uint
+        unsafe { fake(self.display, code, 1, 0); fake(self.display, code, 0, 0) }
+        for held in modifiers.iter().rev() {
+            unsafe { fake(self.display, self.keycode(held) as ffi::c_uint, 0, 0) }
+        }
+        self.sync()
+    }
+
+    /// Restores focus to `window` when it still exists, then disconnects.
+    pub fn close(&self, previous: u64 = 0) -> () {
+        if previous > 1 && self.viewable(previous) { self.set_focus(previous) }
+        let close = self.lib.close_display
+        unsafe { close(self.display) }
+    }
+}

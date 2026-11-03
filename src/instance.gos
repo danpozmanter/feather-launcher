@@ -1,0 +1,123 @@
+// Linux abstract sockets provide atomic ownership without stale lock files.
+// The address is per user, shared by every display and installation.
+use std::{env, errors, ffi}
+use std::ffi::Ptr
+use gui
+use wake
+
+const AF_UNIX: i32 = 1
+const SOCKET_FLAGS: i32 = 2 | 0x800 | 0x80000 // DATAGRAM | NONBLOCK | CLOEXEC.
+const ADDRESS_IN_USE: i64 = 98
+const WOULD_BLOCK: i64 = 11
+// An activation is a marker byte and the requester's Wayland activation
+// token, which windowing accepts up to 4096 bytes.
+const TOKEN_MAX: i64 = 4096
+
+#[link(name = "c")]
+unsafe extern "C" {
+    fn socket(domain: i32, kind: i32, protocol: i32) -> i32
+    fn bind(fd: i32, address: Ptr<u8>, len: u32) -> i32
+    fn sendto(fd: i32, data: Ptr<u8>, len: usize, flags: i32, address: Ptr<u8>, address_len: u32) -> isize
+    fn recv(fd: i32, data: Ptr<u8>, len: usize, flags: i32) -> isize
+    fn close(fd: i32) -> i32
+    fn getuid() -> u32
+    fn getpid() -> i32
+}
+
+// None means another instance owns the socket; activate it only when asked.
+pub fn acquire(activate: bool = true) -> Result<Option<i32>, errors::Error> {
+    let uid = unsafe { getuid() }
+    acquire_name(f"dev.gossamer.feather-launcher.{uid}", activate)
+}
+
+fn acquire_name(socket_name: String, activate: bool = true) -> Result<Option<i32>, errors::Error> {
+    let name = socket_name.bytes()
+    if name.len() > 107 { return Err(errors::new("The instance socket name is too long")) }
+    let address: Ptr<u8> = unsafe { ffi::alloc(110) }
+    unsafe { ffi::write(address.cast::<u16>(), AF_UNIX as u16) }
+    for (i, byte) in name.iter().enumerate() {
+        unsafe { ffi::write_at(address, i + 3, byte) }
+    }
+    let len = (3 + name.len()) as u32
+    let fd = unsafe { socket(AF_UNIX, SOCKET_FLAGS, 0) }
+    if fd < 0 {
+        let why = ffi::last_errno()
+        unsafe { ffi::free(address) }
+        return Err(errors::new(f"Could not create the instance socket: errno {why}"))
+    }
+    let bound = unsafe { bind(fd, address, len) }
+    let why = ffi::last_errno()
+    if bound == 0 {
+        unsafe { ffi::free(address) }
+        return Ok(Some(fd))
+    }
+    if why != ADDRESS_IN_USE {
+        unsafe { close(fd); ffi::free(address) }
+        return Err(errors::new(f"Could not own the instance socket: errno {why}"))
+    }
+    if !activate {
+        unsafe { close(fd); ffi::free(address) }
+        return Ok(None)
+    }
+    // An activation request, never a toggle. A full mailbox already
+    // contains an activation and is therefore also success.
+    let token = env::var("XDG_ACTIVATION_TOKEN").unwrap_or("")
+    let payload = ("a" + if token.byte_len() <= TOKEN_MAX { token } else { "" }).bytes()
+    let data: Ptr<u8> = unsafe { ffi::alloc(payload.len()) }
+    unsafe { ffi::write_bytes(data, payload) }
+    let sent = unsafe { sendto(fd, data, payload.len() as usize, 0, address, len) }
+    let send_error = ffi::last_errno()
+    unsafe { close(fd); ffi::free(address); ffi::free(data) }
+    if sent < 0 && send_error != WOULD_BLOCK {
+        return Err(errors::new(f"Could not activate the existing Feather: errno {send_error}"))
+    }
+    Ok(None)
+}
+
+/// Drains pending activation requests. Answers None when there were none,
+/// else the newest request's activation token, or "" when it had none.
+pub fn activated(fd: i32) -> Option<String> {
+    let buffer: Ptr<u8> = unsafe { ffi::alloc(TOKEN_MAX + 1) }
+    let mut newest = None
+    loop {
+        let got = unsafe { recv(fd, buffer, (TOKEN_MAX + 1) as usize, 0) }
+        if got <= 0 { break }
+        let bytes = unsafe { ffi::read_bytes(buffer, got as i64) }
+        newest = Some(String::from_utf8(bytes[1..]).unwrap_or(String::new()))
+    }
+    unsafe { ffi::free(buffer) }
+    newest
+}
+
+// Post through the GUI mailbox so an idle platform wait wakes immediately.
+// Blocks in poll(2), so it must run on a dedicated thread; `shutdown` ends it.
+pub fn watch(fd: i32, mailbox: gui::Mailbox, shutdown: wake::Wake) -> Result<(), errors::Error> {
+    loop {
+        let ready = wake::wait(#[shutdown.fd, fd])?
+        if ready[0] { return Ok(()) }
+        if let Some(token) = activated(fd) { mailbox.post(gui::UiMsg::Custom("activate", token)) }
+    }
+}
+
+pub fn release(fd: i32) -> () {
+    unsafe { close(fd) }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ownership_is_exclusive_activation_is_delivered_and_close_releases_it() {
+        let pid = unsafe { super::getpid() }
+        let name = f"feather-instance-test.{pid}"
+        let first = super::acquire_name(name).unwrap().unwrap()
+        let second = super::acquire_name(name).unwrap()
+        let activated = super::activated(first).is_some()
+        let drained = super::activated(first).is_none()
+        super::release(first)
+        let next = super::acquire_name(name).unwrap().unwrap()
+        super::release(next)
+        assert(second.is_none())
+        assert(activated)
+        assert(drained)
+    }
+}

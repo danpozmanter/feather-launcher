@@ -1,0 +1,186 @@
+// Headless integration checks use the same native window operations as production.
+use std::{env, errors}
+use std::sync::{Receiver, Shared}
+use gui
+use gui::{UiMsg}
+use windowing::{Key, Mods}
+use app::DEFAULT_LAUNCH_KEY
+use windows
+use hotkey
+
+// Reads one rebinding from the channel the update closure posts to. `want`
+// is what must have arrived, or None when nothing may have.
+fn expect_binding(rx: Receiver<String>, want: Option<String>) -> Result<(), errors::Error> {
+    let got = select {
+        v = rx.recv() => v
+        default => None
+    }
+    if got != want { return Err(errors::new(f"the hotkey binding channel answered {got}, wanted {want}")) }
+    Ok(())
+}
+
+// --fixture: drive the hidden-to-shown cycle headlessly and record launches.
+// Every window change here is applied by hand, the way the driver loop does
+// it, and `shown` is checked against the window's focus.
+pub fn run(mut s: gui::Session, shown: Shared<i64>, rx: Receiver<String>) -> Result<(), errors::Error> {
+    // The box opens when the program starts.
+    if shown.get() != 1 { return Err(errors::new("the run box did not open at start")) }
+    windows::show(s)?
+    if s.focused() != "run" { return Err(errors::new(f"the run box did not open with focus: focus is \u{201c}{s.focused()}\u{201d}")) }
+
+    sizing(s)?
+
+    s.press(Key::Escape, Mods::default())?
+    s.flush()?
+    if shown.get() != 0 { return Err(errors::new("Escape did not hide the run box")) }
+    windows::hide(s)?
+
+    s.emit(UiMsg::Custom("hotkey", ""))
+    s.flush()?
+    if shown.get() == 0 { return Err(errors::new("the hotkey did not show the run box")) }
+    windows::show(s)?
+    if s.focused() != "run" { return Err(errors::new(f"the hotkey did not raise the run box: focus is \u{201c}{s.focused()}\u{201d}")) }
+
+    s.type_text("t")?
+    s.advance(1)?
+    if !s.semantics(0).dump().contains("listitem \"Terminal\"") {
+        return Err(errors::new(f"typing proposed nothing: {s.semantics(0).dump()}"))
+    }
+
+    if let Some(path) = env::var("FEATHER_FIXTURE_SCREENSHOT") {
+        s.press(Key::Down, Mods::default())?
+        s.screenshot(path)?
+    }
+
+    // Escape must hide the launcher even with completion open.
+    s.press(Key::Escape, Mods::default())?
+    if shown.get() != 0 { return Err(errors::new("Escape over completion did not hide the launcher")) }
+    windows::hide(s)?
+    s.emit(UiMsg::Custom("hotkey", ""))
+    s.flush()?
+    windows::show(s)?
+    s.type_text("t")?
+    s.advance(1)?
+    s.press(Key::Return, Mods::default())?
+    s.flush()?
+    if shown.get() != 0 { return Err(errors::new("a successful launch did not hide the run box")) }
+    windows::hide(s)?
+    if s.window_visible(0) { return Err(errors::new("the launch hid the model but the window stayed up")) }
+
+    s.emit(UiMsg::Custom("hotkey", ""))
+    s.flush()?
+    if shown.get() == 0 { return Err(errors::new("the hotkey did not show the run box again")) }
+    windows::show(s)?
+
+    s.press(Key::Escape, Mods::default())?
+    s.flush()?
+    if shown.get() != 0 { return Err(errors::new("Escape did not hide the run box")) }
+
+    let mut ctrl = Mods::default()
+    ctrl.ctrl = true
+    s.emit(UiMsg::Custom("hotkey", ""))
+    s.flush()?
+    windows::show(s)?
+
+    // The settings icon opens a separate window; a Change… button
+    // opens the capture dialog, and the captured combination rebinds the
+    // global hotkey at once (the watcher picks it up between events).
+    if !s.click("app.settings")? { return Err(errors::new("The settings icon is missing")) }
+    s.flush()?
+    s.emit(UiMsg::Click("settings.launch"))
+    s.flush()?
+    expect_binding(rx, Some(hotkey::CAPTURE_PAUSE))?
+    if s.window_count() != 3 { return Err(errors::new("The shortcut dialog did not get its own window")) }
+    let capture_window = s.window_id(2)
+    s.inject(windowing::Event::KeyDown { window: capture_window, key: Key::Home, scancode: windowing::Scancode::Unknown, mods: ctrl, repeat: false })?
+    if s.dialog_draft("shortcut.launch").0 != "Ctrl+Home" { return Err(errors::new("The shortcut dialog did not capture Ctrl+Home")) }
+    s.inject(windowing::Event::KeyDown { window: capture_window, key: Key::Return, scancode: windowing::Scancode::Unknown, mods: Mods::default(), repeat: false })?
+    if s.window_count() != 2 { return Err(errors::new("Set did not close the shortcut dialog")) }
+    expect_binding(rx, Some("Ctrl+Home"))?
+    // A key with no global form is refused; nothing is posted.
+    s.emit(UiMsg::Dialog("shortcut.launch", gui::Outcome::Shortcut("Ctrl+Help")))
+    s.flush()?
+    expect_binding(rx, None)?
+    // Clearing the capture switches the hotkey off.
+    s.emit(UiMsg::Dialog("shortcut.launch", gui::Outcome::Shortcut("")))
+    s.flush()?
+    expect_binding(rx, Some(""))?
+    // And the default comes back.
+    s.emit(UiMsg::Dialog("shortcut.launch", gui::Outcome::Shortcut(DEFAULT_LAUNCH_KEY)))
+    s.flush()?
+    expect_binding(rx, Some(DEFAULT_LAUNCH_KEY))?
+    // Close the shortcut capture before exercising Settings dismissal.
+    s.close_dialog("shortcut.launch", gui::Outcome::Cancelled)
+    s.flush()?
+    if s.window_count() != 2 { return Err(errors::new("Settings did not open")) }
+    let settings_id = s.window_id(1)
+    s.inject(windowing::Event::KeyDown { window: settings_id, key: Key::Escape, scancode: windowing::Scancode::Unknown, mods: Mods::default(), repeat: false })?
+    if s.window_count() != 1 { return Err(errors::new("Escape did not close Settings")) }
+    if !s.click("app.settings")? { return Err(errors::new("The settings icon is missing after closing Settings")) }
+    s.flush()?
+    s.inject(windowing::Event::CloseRequested { window: s.window_id(1) })?
+    if s.window_count() != 1 { return Err(errors::new("The Settings X button did not close it")) }
+
+    // Losing focus hides the same native launcher, without changing its id
+    // or allowing Settings to take over window zero.
+    if !s.click("app.settings")? { return Err(errors::new("The settings icon is missing")) }
+    s.flush()?
+    let main_id = s.window_id(0)
+    s.set_active(true)?
+    s.set_active(false)?
+    if shown.get() != 0 { return Err(errors::new("Losing focus did not dismiss the launcher")) }
+    windows::hide(s)?
+    if s.window_id(0) != main_id { return Err(errors::new("Hiding the launcher replaced its native window")) }
+    // Exercise each native window in separate fixture runs.
+    let mut quit_mods = ctrl
+    quit_mods.shift = true
+    if env::args().contains("--quit-from-main") {
+        s.emit(UiMsg::Custom("activate", ""))
+        s.flush()?
+        windows::show(s)?
+        s.type_text("t")?
+        s.advance(1)?
+        s.press(Key::Q, ctrl)?
+        if shown.get() == 2 { return Err(errors::new("Ctrl+Q unexpectedly quit Feather")) }
+        s.press(Key::Q, quit_mods)?
+        if shown.get() != 2 { return Err(errors::new("Ctrl+Shift+Q in the launcher did not quit Feather")) }
+    } else {
+        s.inject(windowing::Event::KeyDown { window: s.window_id(1), key: Key::Q, scancode: windowing::Scancode::Unknown, mods: ctrl, repeat: false })?
+        if shown.get() == 2 { return Err(errors::new("Ctrl+Q unexpectedly quit Feather")) }
+        s.inject(windowing::Event::KeyDown { window: s.window_id(1), key: Key::Q, scancode: windowing::Scancode::Unknown, mods: quit_mods, repeat: false })?
+        if shown.get() != 2 { return Err(errors::new("Ctrl+Shift+Q in Settings did not quit Feather")) }
+    }
+
+    println("feather-launcher: stable completion sizing, startup focus, Escape over completion, stable window identity, settings icon, Settings Escape and X, shortcut rebinding, and Ctrl+Shift+Q passed; no process started")
+    Ok(())
+}
+
+
+// Search refinement must not move the field, drift in size for repeated
+// queries, or continue resizing after completion settles.
+fn sizing(mut s: gui::Session) -> Result<(), errors::Error> {
+    let field = s.rect_of("run")
+    let base = s.window_pixel_size(0)
+    let mut ctrl = Mods::default()
+    ctrl.ctrl = true
+    let mut heights = #[]
+    for query in #["t", "te", "term", "zzz", "t", ""] {
+        s.press(Key::A, ctrl)?
+        s.type_text(query)?
+        s.advance(1)?
+        let size = s.window_pixel_size(0)
+        for _ in 0..3 {
+            s.advance(1)?
+            if s.rect_of("run") != field { return Err(errors::new(f"Resizing moved the entry box for {query}: {field} became {s.rect_of("run")}")) }
+            if s.window_pixel_size(0) != size { return Err(errors::new("The completion window did not settle")) }
+        }
+        if size.0 != base.0 { return Err(errors::new("Typing changed the launcher width")) }
+        heights.push(size.1)
+    }
+    if !(heights[0] > heights[1] && heights[1] > heights[2]) {
+        return Err(errors::new(f"Refining a search did not shrink with its results: {heights}"))
+    }
+    if heights[0] != heights[4] { return Err(errors::new("Repeating a query changed the window height")) }
+    if heights[5] != base.1 { return Err(errors::new("Clearing the query did not restore the compact window")) }
+    Ok(())
+}

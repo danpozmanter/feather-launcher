@@ -1,0 +1,32 @@
+// Native window operations keep the launcher at index zero for its lifetime.
+use std::errors
+use gui
+use app
+
+const WIDTH: i64 = 560
+const HEIGHT: i64 = 52
+
+pub fn prepare(mut s: gui::Session) -> Result<(), errors::Error> {
+    let mut style = gui::WindowStyle::default()
+    style.frameless = true
+    style.top_center = true
+    style.dismissible = true
+    s.prepare_window_with("main", "Feather", WIDTH, HEIGHT, style)?
+    s.set_close_policy("main", gui::ClosePolicy::Ask)
+    s.grow_for_popups("main", HEIGHT)?
+    s.set_icon(gui::AppIcon::from_svg(app::ICON_SVG, 128)?)
+}
+
+/// Shows the launcher and gives it focus. `token` is the Wayland activation
+/// token of the request, or "" when there is none.
+pub fn show(mut s: gui::Session, token: String = "") -> Result<(), errors::Error> {
+    s.show_window("main")?
+    s.flush()?
+    s.activate_window(0, token)?
+    s.set_focus(0, "run")
+    Ok(())
+}
+
+pub fn hide(mut s: gui::Session) -> Result<(), errors::Error> {
+    s.hide_window(0)
+}

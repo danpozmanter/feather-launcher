@@ -1,0 +1,60 @@
+site_name: Feather Launcher
+site_url: https://danpozmanter.github.io/feather-launcher/
+site_description: A background run box for Linux. Press Ctrl+Space, type a few letters, press Enter. Written in Gossamer.
+site_author: Dan Pozmanter
+repo_url: https://github.com/danpozmanter/feather-launcher
+repo_name: danpozmanter/feather-launcher
+edit_uri: ""
+
+docs_dir: docs_src
+site_dir: target/site
+
+theme:
+  name: material
+  logo: assets/icon.svg
+  favicon: assets/icon.svg
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - content.code.copy
+
+extra_css:
+  - stylesheets/extra.css
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - User Guide: guide.md
+
+markdown_extensions:
+  - tables
+  - attr_list
+  - md_in_html
+  - admonition
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.keys
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/danpozmanter/feather-launcher

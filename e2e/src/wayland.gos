@@ -1,0 +1,104 @@
+// On Wayland the compositor owns global keys, so Feather asks KDE's
+// kglobalaccel or the desktop portal for its shortcut instead of grabbing
+// the key. This runs Feather against the mocks on a private session bus with
+// a placeholder WAYLAND_DISPLAY, which selects those services, while SDL
+// draws through X11 so the check can see the window.
+use std::{env, errors, fs}
+use support
+use support::{called, canonical, element, ensure}
+use x11
+use x11::X11
+
+const CTRL_SPACE: i64 = 0x04000020
+const CTRL_ALT_T: i64 = 0x0C000054
+
+/// Runs the shortcut service check for each service FEATHER_TEST_SERVICES
+/// names, both by default.
+pub fn check() -> Result<(), errors::Error> {
+    support::require_no_instance()?
+    let x = x11::connect()?
+    defer { x.close() }
+    let folder = fs::temp_dir("feather-wayland")?
+    defer { let _ = fs::remove_dir_all(folder) }
+    for kind in env::var("FEATHER_TEST_SERVICES").unwrap_or("kde portal").split(" ") {
+        if kind != "" { service(kind, x, folder)? }
+    }
+    println("PASS: KDE kglobalaccel and portal GlobalShortcuts register, toggle, adopt changes, and release")
+    Ok(())
+}
+
+fn service(kind: String, x: X11, folder: String) -> Result<(), errors::Error> {
+    let log = f"{folder}/{kind}.jsonl"
+    let kde = kind == "kde"
+    let mut bus = support::private_bus(folder)?
+    defer { bus.daemon.stop() }
+    let env = #[
+        ("DBUS_SESSION_BUS_ADDRESS", bus.address)
+        ("SDL_VIDEO_DRIVER", "x11")
+        ("WAYLAND_DISPLAY", "feather-test-none")
+        ("XDG_CONFIG_HOME", folder)
+        ("XDG_CURRENT_DESKTOP", if kde { "KDE" } else { "GNOME" })
+    ]
+    let mut mock = support::mock(kind, log, env)?
+    defer { mock.stop() }
+    let destination = if kde { "org.kde.kglobalaccel" } else { "org.freedesktop.portal.Desktop" }
+    let mut child = support::launch(env)?
+    defer { child.stop() }
+    let launcher = x.wait_window(child.pid())?
+    if kde {
+        // The conflicting KDE action keeps its other key; Feather takes Ctrl+Space.
+        support::wait_for("a KDE shortcut assignment", || called(log, "setShortcutKeys").any(|call| element(call, 1) != "[]"))?
+        ensure(called(log, "doRegister").len() > 0, "Feather did not register with kglobalaccel")?
+        let released = called(log, "setForeignShortcutKeys")
+        let wanted = canonical("[[\"test\", \"action\", \"Test\", \"Action\"], [[[777, 888, 0, 0]]]]")
+        ensure(released == #[wanted], f"Unexpected release: {released}")?
+        let assigned = called(log, "setShortcutKeys")
+        let keys = element(assigned[assigned.len() - 1], 1)
+        ensure(keys == canonical(f"[[[{CTRL_SPACE}, 0, 0, 0]]]"), f"Unexpected assignment: {keys}")?
+    } else {
+        support::wait_for("the portal binding", || called(log, "BindShortcuts").len() > 0)?
+        let registered = called(log, "Register")
+        ensure(registered.len() > 0 && element(registered[0], 0) == "\"dev.gossamer.feather-launcher\"", f"Unexpected registration: {registered}")?
+        let shortcut = element(called(log, "BindShortcuts")[0], 1)
+        let wanted = canonical("[[\"launch\", {\"description\": \"Show Feather\", \"preferred_trigger\": \"CTRL+space\"}]]")
+        ensure(shortcut == wanted, f"Unexpected shortcut: {shortcut}")?
+    }
+    support::wait_for("the launcher to show", || x.viewable(launcher))?
+    x.key(launcher, x11::XK_ESCAPE)
+    support::wait_for("Escape to hide the launcher", || !x.viewable(launcher))?
+    // The desktop's shortcut toggles the launcher, shown and hidden.
+    press(env, destination, "Press", "token-1")?
+    support::wait_for("the shortcut to show the launcher", || x.viewable(launcher))?
+    press(env, destination, "Press", "token-2")?
+    support::wait_for("the shortcut to hide the launcher", || !x.viewable(launcher))?
+    press(env, destination, "Press", "")?
+    support::wait_for("the shortcut to show it without a token", || x.viewable(launcher))?
+    if kde {
+        // A change made in System Settings is adopted, not overwritten.
+        let before = called(log, "setShortcutKeys").len()
+        press(env, destination, "Rebind", f"{CTRL_ALT_T}")?
+        press(env, destination, "Press", "")?
+        support::wait_for("the rebound shortcut to hide the launcher", || !x.viewable(launcher))?
+        ensure(called(log, "setShortcutKeys").len() == before, "Feather overwrote the rebound shortcut")?
+        press(env, destination, "Press", "")?
+        support::wait_for("the rebound shortcut to show the launcher", || x.viewable(launcher))?
+    }
+    support::wait_for("launcher focus", || x.focus() == launcher)?
+    x.quit_shortcut()
+    let code = child.wait()?
+    if code != 0 { return Err(errors::new(f"Quitting exited {code}: {child.errors()}")) }
+    if kde {
+        let unregistered = called(log, "unregister")
+        ensure(unregistered == #[canonical("[\"feather-launcher\", \"launch\"]")], f"Unexpected unregister: {unregistered}")?
+    } else {
+        ensure(called(log, "Close").len() > 0, "Feather did not close its portal session")?
+    }
+    Ok(())
+}
+
+// Calls the mock's org.feather.Test `method`, which sends the signal a real
+// desktop sends when the user acts.
+fn press(env: Vec<(String, String)>, destination: String, method: String, argument: String) -> Result<(), errors::Error> {
+    let out = support::command("gdbus", env).args(#["call", "--session", "--dest", destination, "--object-path", "/test", "--method", f"org.feather.Test.{method}", argument]).output()?
+    ensure(out.code == 0, f"gdbus {method} failed: {out.stderr}")
+}

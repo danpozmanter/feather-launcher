@@ -1,0 +1,249 @@
+// KDE's shortcut service, kglobalaccel, over D-Bus. Feather uses it to
+// release a conflicting desktop shortcut, keeping every other key on that
+// action, and on Wayland to own its launch shortcut, since KWin delivers
+// global keys only to kglobalaccel's clients.
+use std::{env, errors}
+use gui
+use bus
+use bus::{Bus, Value}
+use windowing::Key
+
+const SERVICE: String = "org.kde.kglobalaccel"
+const ROOT: String = "/kglobalaccel"
+const IFACE: String = "org.kde.KGlobalAccel"
+const COMPONENT_IFACE: String = "org.kde.kglobalaccel.Component"
+
+/// Feather's kglobalaccel component, as System Settings lists it.
+pub const COMPONENT: String = "feather-launcher"
+const ACTION: String = "launch"
+
+// KGlobalAccel::SetPresent | KGlobalAccel::NoAutoloading: the keys given
+// replace any stored assignment, and the action counts as running.
+const SET_PRESENT_NO_AUTOLOAD: i64 = 6
+
+const QT_SHIFT: i64 = 0x02000000
+const QT_CTRL: i64 = 0x04000000
+const QT_ALT: i64 = 0x08000000
+const QT_META: i64 = 0x10000000
+const QT_MODIFIERS: i64 = QT_SHIFT | QT_CTRL | QT_ALT | QT_META
+
+pub fn is_kde() -> bool {
+    env::var("XDG_CURRENT_DESKTOP").unwrap_or("").split(":").contains("KDE")
+}
+
+// Keys a global binding may use, in the order the reverse mapping tries them.
+fn bindable_keys() -> Vec<Key> {
+    #[Key::A, Key::B, Key::C, Key::D, Key::E, Key::F, Key::G, Key::H, Key::I, Key::J, Key::K, Key::L, Key::M
+        Key::N, Key::O, Key::P, Key::Q, Key::R, Key::S, Key::T, Key::U, Key::V, Key::W, Key::X, Key::Y, Key::Z
+        Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9
+        Key::Space, Key::Tab, Key::Return, Key::Escape, Key::Backspace, Key::Delete, Key::Insert, Key::Home
+        Key::End, Key::PageUp, Key::PageDown, Key::PrintScreen, Key::Pause, Key::ScrollLock
+        Key::F1, Key::F2, Key::F3, Key::F4, Key::F5, Key::F6, Key::F7, Key::F8, Key::F9, Key::F10, Key::F11, Key::F12]
+}
+
+// The Qt::Key of `key`, without modifiers.
+fn qt_base(key: Key) -> Option<i64> {
+    match key {
+        Key::Space => Some(0x20)
+        Key::Tab => Some(0x01000001)
+        Key::Return => Some(0x01000004)
+        Key::Escape => Some(0x01000000)
+        Key::Backspace => Some(0x01000003)
+        Key::Delete => Some(0x01000007)
+        Key::Insert => Some(0x01000006)
+        Key::Home => Some(0x01000010)
+        Key::End => Some(0x01000011)
+        Key::PageUp => Some(0x01000016)
+        Key::PageDown => Some(0x01000017)
+        Key::PrintScreen => Some(0x01000009)
+        Key::Pause => Some(0x01000008)
+        Key::ScrollLock => Some(0x01000026)
+        _ => {
+            let sym = crate::hotkey::keysym_of(key)?
+            if sym >= 0x61 && sym <= 0x7a { Some(sym as i64 - 32) }
+            else if sym >= 0x30 && sym <= 0x39 { Some(sym as i64) }
+            else if sym >= 0xffbe && sym <= 0xffc9 { Some(0x01000030 + (sym - 0xffbe) as i64) }
+            else { None }
+        }
+    }
+}
+
+// The Qt key code, modifiers included, of a binding in `Shortcut::parse`
+// text form, or None when it is not one globally bindable stroke.
+fn qt_key(text: String) -> Option<i64> {
+    let _ = crate::hotkey::bindable(text)?
+    let s = gui::Shortcut::parse(text)?.strokes[0]
+    let mut code = qt_base(s.key)?
+    if s.shift { code |= QT_SHIFT }
+    if s.ctrl || s.primary { code |= QT_CTRL }
+    if s.alt { code |= QT_ALT }
+    if s.meta { code |= QT_META }
+    Some(code)
+}
+
+// The `Shortcut::parse` text of a Qt key code, for a binding the desktop made.
+fn shortcut_text(code: i64) -> Option<String> {
+    let base = code & !QT_MODIFIERS
+    let key = bindable_keys().iter().find(|k| qt_base(k) == Some(base))?
+    let mut stroke = gui::KeyStroke::new(key)
+    stroke.shift = code & QT_SHIFT != 0
+    stroke.ctrl = code & QT_CTRL != 0
+    stroke.alt = code & QT_ALT != 0
+    stroke.meta = code & QT_META != 0
+    Some(stroke.label())
+}
+
+// A QKeySequence as kglobalaccel sends it: up to four strokes, padded with 0.
+fn strokes(sequence: Value) -> Vec<i64> {
+    let Value::Struct(fields) = sequence else { return #[] }
+    let Some(Value::Array(_, codes)) = fields.first() else { return #[] }
+    codes.iter().filter_map(|c| if let Value::I32(n) = c && n != 0 { Some(n) } else { None }).collect()
+}
+
+fn sequence_of(code: i64) -> Value {
+    Value::Struct(#[Value::Array("i", #[Value::I32(code), Value::I32(0), Value::I32(0), Value::I32(0)])])
+}
+
+fn sequences(codes: Vec<i64>) -> Value {
+    Value::Array("(ai)", codes.map(sequence_of))
+}
+
+fn action_id() -> Value {
+    Value::Array("s", #[Value::Str(COMPONENT), Value::Str(ACTION), Value::Str("Feather"), Value::Str("Show Feather")])
+}
+
+fn call(b: Bus, method: String, args: Vec<Value>) -> Result<Vec<Value>, errors::Error> {
+    b.call(SERVICE, ROOT, IFACE, method, args)
+}
+
+// Removes `key` from every other action that holds it. Each pass releases one
+// owner; an owner that keeps the key after its release is an error.
+fn release_conflicts(b: Bus, key: i64) -> Result<(), errors::Error> {
+    let mut released: Vec<Value> = #[]
+    loop {
+        let reply = call(b, "action", #[Value::I32(key)])?
+        let Some(action) = reply.first() else { return Err(errors::new("Invalid KDE shortcut action reply")) }
+        let Value::Array(_, names) = action else { return Err(errors::new("Invalid KDE shortcut action reply")) }
+        if names.is_empty() { return Ok(()) }
+        if names.len() >= 2 && names[0] == Value::Str(COMPONENT) && names[1] == Value::Str(ACTION) { return Ok(()) }
+        if released.contains(action) { return Err(errors::new("KDE did not release the conflicting shortcut")) }
+        let keys = call(b, "shortcutKeys", #[action])?
+        let Some(Value::Array(_, held)) = keys.first() else { return Err(errors::new("Invalid KDE shortcut keys reply")) }
+        let keep = held.filter(|seq| strokes(seq) != #[key])
+        call(b, "setForeignShortcutKeys", #[action, Value::Array("(ai)", keep)])?
+        released.push(action)
+    }
+}
+
+/// On KDE, releases any other desktop action bound to `text` so Feather can
+/// take it. Elsewhere, and for keys KDE cannot express, it does nothing.
+pub fn override_binding(text: String) -> Result<(), errors::Error> {
+    if !is_kde() { return Ok(()) }
+    let Some(key) = qt_key(text) else { return Ok(()) }
+    let b = bus::session()?
+    let result = release_conflicts(b, key)
+    b.close()
+    result
+}
+
+/// Feather's launch action registered with kglobalaccel on `b`.
+#[derive(Debug, PartialEq)]
+pub struct Registration {
+    /// The component object whose signals report presses.
+    pub path: String
+}
+
+/// Registers the launch action and subscribes to its presses and to changes
+/// made in System Settings. The action starts with no key.
+pub fn register(b: Bus) -> Result<Registration, errors::Error> {
+    call(b, "doRegister", #[action_id()])?
+    let reply = call(b, "getComponent", #[Value::Str(COMPONENT)])?
+    let Some(path) = reply.first().and_then(|v| bus::text(v)) else { return Err(errors::new("Invalid KDE component reply")) }
+    b.add_match(f"type='signal',path='{path}',interface='{COMPONENT_IFACE}'")?
+    b.add_match(f"type='signal',path='{ROOT}',interface='{IFACE}',member='yourShortcutsChanged'")?
+    Ok(Registration { path: path })
+}
+
+/// Gives the launch action `text`, or no key for "". Conflicting desktop
+/// shortcuts are released first. Errs when KDE does not assign the key.
+pub fn bind(b: Bus, text: String) -> Result<(), errors::Error> {
+    let codes = if text == "" { #[] } else {
+        let Some(key) = qt_key(text) else { return Err(errors::new(f"KDE cannot bind {text}")) }
+        release_conflicts(b, key)?
+        #[key]
+    }
+    let reply = call(b, "setShortcutKeys", #[action_id(), sequences(codes), Value::U32(SET_PRESENT_NO_AUTOLOAD)])?
+    let Some(Value::Array(_, assigned)) = reply.first() else { return Err(errors::new("Invalid KDE shortcut reply")) }
+    let got = assigned.map(strokes).filter(|s| !s.is_empty())
+    if got != codes.map(|c| #[c]) { return Err(errors::new(f"KDE kept {text} for another action")) }
+    Ok(())
+}
+
+/// Removes the launch action, so KDE stops watching its key and System
+/// Settings lists no shortcut for a Feather that is not running.
+pub fn unregister(b: Bus) -> Result<(), errors::Error> {
+    call(b, "unregister", #[Value::Str(COMPONENT), Value::Str(ACTION)])?
+    Ok(())
+}
+
+/// What a kglobalaccel signal means for Feather.
+#[derive(Debug, PartialEq)]
+pub enum Event {
+    Pressed
+    Released
+    /// The binding was changed in System Settings, in `Shortcut::parse` form,
+    /// or "" when it was removed or is not one Feather can show.
+    Rebound(String)
+    Unrelated
+}
+
+pub fn event(reg: Registration, s: bus::Signal) -> Event {
+    if s.path == reg.path && s.interface == COMPONENT_IFACE && s.args.len() >= 2 && s.args[1] == Value::Str(ACTION) {
+        if s.member == "globalShortcutPressed" { return Event::Pressed }
+        if s.member == "globalShortcutReleased" { return Event::Released }
+    }
+    if s.member == "yourShortcutsChanged" && s.args.len() == 2 {
+        let Value::Array(_, names) = s.args[0] else { return Event::Unrelated }
+        if names.len() < 2 || names[0] != Value::Str(COMPONENT) || names[1] != Value::Str(ACTION) { return Event::Unrelated }
+        let Value::Array(_, keys) = s.args[1] else { return Event::Unrelated }
+        let first = keys.map(strokes).iter().find(|seq| seq.len() == 1)
+        return Event::Rebound(first.and_then(|seq| shortcut_text(seq[0])).unwrap_or(""))
+    }
+    Event::Unrelated
+}
+
+#[cfg(test)]
+mod tests {
+    use bus::Value
+
+    #[test]
+    fn kde_key_codes_round_trip_through_shortcut_text() {
+        assert_eq(super::qt_key("Ctrl+Space"), Some(0x04000020))
+        assert_eq(super::qt_key("Ctrl+Alt+T"), Some(0x0c000054))
+        assert_eq(super::qt_key("F12"), Some(0x0100003b))
+        assert_eq(super::qt_key("T"), None)
+        assert_eq(super::shortcut_text(0x04000020), Some("Ctrl+Space"))
+        assert_eq(super::shortcut_text(0x0c000054), Some("Ctrl+Alt+T"))
+        assert_eq(super::shortcut_text(0x0100003b), Some("F12"))
+    }
+
+    #[test]
+    fn padded_key_sequences_compare_by_their_strokes() {
+        let padded = super::sequence_of(0x04000020)
+        assert_eq(super::strokes(padded), #[0x04000020])
+        let chord = Value::Struct(#[Value::Array("i", #[Value::I32(777), Value::I32(888), Value::I32(0), Value::I32(0)])])
+        assert_eq(super::strokes(chord), #[777, 888])
+    }
+
+    #[test]
+    fn shortcut_signals_map_to_events() {
+        let reg = super::Registration { path: "/component/feather_launcher" }
+        let pressed = bus::Signal { path: reg.path, interface: super::COMPONENT_IFACE, member: "globalShortcutPressed", args: #[Value::Str(super::COMPONENT), Value::Str("launch"), Value::I64(5)] }
+        assert_eq(super::event(reg, pressed), super::Event::Pressed)
+        let changed = bus::Signal {
+            path: "/kglobalaccel", interface: super::IFACE, member: "yourShortcutsChanged"
+            args: #[super::action_id(), super::sequences(#[0x0c000054])]
+        }
+        assert_eq(super::event(reg, changed), super::Event::Rebound("Ctrl+Alt+T"))
+    }
+}

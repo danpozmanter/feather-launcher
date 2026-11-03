@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOSSAMER_REPO: gossamer-lang/gossamer
+  # Every check here runs without a real display.
+  SDL_VIDEO_DRIVER: offscreen
+  # Settings and caches of the runs stay out of the runner's home.
+  XDG_CONFIG_HOME: ${{ github.workspace }}/.ci-config
+  XDG_CACHE_HOME: ${{ github.workspace }}/.ci-cache
+
+# Feather is Linux-only: it relies on abstract Unix sockets, eventfd, procfs,
+# and an X11 hotkey grab, so there is no macOS or Windows job.
+jobs:
+  linux:
+    name: gate (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install SDL's build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config dbus \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxss-dev libxfixes-dev libxkbcommon-dev libwayland-dev \
+            wayland-protocols libegl-dev libgl-dev libdecor-0-dev libdbus-1-dev
+      - name: Install the Gossamer toolchain
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/${GOSSAMER_REPO}/main/scripts/install.sh" | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: gos --version
+      - name: Format, lint and check
+        run: |
+          gos fmt --check
+          gos lint .
+          gos check .
+          gos fmt --check e2e
+          gos lint e2e
+          gos check e2e/src/main.gos
+      - name: Unit tests
+        run: gos test .
+      - name: Release build
+        run: gos build --release .
+      - name: Headless UI fixtures
+        run: |
+          ./target/release/feather-launcher --fixture
+          ./target/release/feather-launcher --fixture --quit-from-main
+      - name: Instance ownership, crash recovery, and daemon startup
+        run: |
+          gos run e2e/src/main.gos instance
+          gos run e2e/src/main.gos daemon
+      - name: Install script
+        run: |
+          ./install.sh --no-build --prefix "$RUNNER_TEMP/feather"
+          "$RUNNER_TEMP/feather/bin/feather-launcher" --version

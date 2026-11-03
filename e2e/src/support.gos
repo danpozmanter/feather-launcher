@@ -1,0 +1,220 @@
+// What every check shares: the built launcher, its processes, the private
+// session bus with the mock desktop services, and the call log they write.
+use std::{errors, ffi, fs, time}
+use std::encoding::json
+use std::ffi::Ptr
+use std::process::{Child, Command, Stdio}
+
+/// The launcher under test, relative to the checkout the harness runs from.
+pub const BINARY: String = "target/release/feather-launcher"
+/// The mock desktop shortcut services.
+pub const MOCK: String = "e2e/desktop_mock.py"
+
+const AF_UNIX: i32 = 1
+const SOCK_DGRAM: i32 = 2
+const ADDRESS_IN_USE: i64 = 98
+
+#[link(name = "c")]
+unsafe extern "C" {
+    fn socket(domain: i32, kind: i32, protocol: i32) -> i32
+    fn bind(fd: i32, address: Ptr<u8>, len: u32) -> i32
+    fn close(fd: i32) -> i32
+    fn getuid() -> u32
+}
+
+/// An error unless `ok` holds.
+pub fn ensure(ok: bool, message: String) -> Result<(), errors::Error> {
+    if ok { Ok(()) } else { Err(errors::new(message)) }
+}
+
+/// Polls `ready` until it holds, failing with `what` after ten seconds.
+pub fn wait_for(what: String, ready: Fn() -> bool) -> Result<(), errors::Error> {
+    let start = time::Instant::now()
+    while start.elapsed().as_millis() < 10_000 {
+        if ready() { return Ok(()) }
+        pause(50)
+    }
+    Err(errors::new(f"Timed out waiting for {what}"))
+}
+
+/// Sleeps for `ms` milliseconds.
+pub fn pause(ms: i64) -> () {
+    time::sleep(time::Duration::from_millis(ms))
+}
+
+/// The per-user abstract socket address a running Feather owns.
+pub fn instance_address() -> String {
+    let uid = unsafe { getuid() }
+    f"dev.gossamer.feather-launcher.{uid}"
+}
+
+/// Fails when a Feather is already running, so a check never drives it.
+pub fn require_no_instance() -> Result<(), errors::Error> {
+    ensure(fs::is_file(BINARY), f"{BINARY} is missing: run gos build --release . from the checkout")?
+    let name = instance_address().bytes()
+    let address: Ptr<u8> = unsafe { ffi::alloc(110) }
+    unsafe { ffi::write(address.cast::<u16>(), AF_UNIX as u16) }
+    for (i, byte) in name.iter().enumerate() {
+        unsafe { ffi::write_at(address, i + 3, byte) }
+    }
+    let fd = unsafe { socket(AF_UNIX, SOCK_DGRAM, 0) }
+    let bound = unsafe { bind(fd, address, (3 + name.len()) as u32) }
+    let why = ffi::last_errno()
+    unsafe { close(fd); ffi::free(address) }
+    if bound == 0 { return Ok(()) }
+    if why == ADDRESS_IN_USE { return Err(errors::new("Stop the running Feather before this check")) }
+    Err(errors::new(f"Could not probe the instance socket: errno {why}"))
+}
+
+/// A launched process whose exit status is kept once observed.
+pub struct Proc {
+    child: Child
+    code: Option<i64>
+}
+
+impl Proc {
+    /// Wraps a spawned child.
+    pub fn new(child: Child) -> Proc {
+        Proc { child: child, code: None }
+    }
+
+    /// The process id.
+    pub fn pid(&self) -> i64 {
+        self.child.id()
+    }
+
+    /// Whether the process has yet to exit.
+    pub fn running(&mut self) -> bool {
+        if self.code.is_some() { return false }
+        match self.child.wait_timeout(0) {
+            Ok(Some(code)) => {
+                self.code = Some(code)
+                false
+            }
+            Ok(None) => true
+            Err(_) => false
+        }
+    }
+
+    /// The exit status, waiting at most `ms` milliseconds for it.
+    pub fn wait(&mut self, ms: i64 = 5000) -> Result<i64, errors::Error> {
+        if let Some(code) = self.code { return Ok(code) }
+        let Some(code) = self.child.wait_timeout(ms)? else {
+            return Err(errors::new(f"Process {self.pid()} did not exit within {ms} ms"))
+        }
+        self.code = Some(code)
+        Ok(code)
+    }
+
+    /// Everything the process wrote to its piped standard error.
+    pub fn errors(&self) -> String {
+        self.child.read_stderr()
+    }
+
+    /// Kills the process when it is still running and reaps it.
+    pub fn stop(&mut self) -> () {
+        if self.running() {
+            let _ = self.child.kill()
+            let _ = self.wait()
+        }
+    }
+}
+
+/// A command for `program` with `env` laid over this process's environment.
+pub fn command(program: String, env: Vec<(String, String)>) -> Command {
+    let mut cmd = Command::new(program)
+    for (key, value) in env {
+        cmd = cmd.env(key, value)
+    }
+    cmd
+}
+
+/// Starts the launcher with `args`, its standard error piped.
+pub fn launch(env: Vec<(String, String)>, args: Vec<String> = #[]) -> Result<Proc, errors::Error> {
+    let child = command(BINARY, env).args(args).stdout(Stdio::Null).stderr(Stdio::Piped).spawn()?
+    Ok(Proc::new(child))
+}
+
+/// Runs the launcher with `args` to completion and fails unless it exits 0.
+pub fn activate(env: Vec<(String, String)>, args: Vec<String> = #[]) -> Result<(), errors::Error> {
+    let out = command(BINARY, env).args(args).output()?
+    ensure(out.code == 0, f"{BINARY} {args} exited {out.code}: {out.stderr}")
+}
+
+// A session bus that names no service directories: only the mocks serve on
+// it, so a name nothing owns answers ServiceUnknown instead of starting the
+// desktop's own service, which would outlive the check.
+const BUS_CONFIG: String = """
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:tmpdir=/tmp</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"""
+
+/// A private session bus, so no check touches the desktop's own services.
+pub struct Bus {
+    pub daemon: Proc
+    pub address: String
+}
+
+/// Starts a private dbus-daemon, configured in `folder`, and answers its
+/// address.
+pub fn private_bus(folder: String) -> Result<Bus, errors::Error> {
+    let config = f"{folder}/bus.conf"
+    fs::write(config, BUS_CONFIG.bytes())?
+    let child = Command::new("dbus-daemon").args(#[f"--config-file={config}", "--nofork", "--print-address=1"]).stdout(Stdio::Piped).spawn()?
+    let address = child.read_stdout_line().unwrap_or(None).unwrap_or("").trim()
+    ensure(address != "", "dbus-daemon printed no address")?
+    Ok(Bus { daemon: Proc::new(child), address: address })
+}
+
+/// Starts the mock `kind` services (kde or portal) logging calls to `log`.
+pub fn mock(kind: String, log: String, env: Vec<(String, String)>) -> Result<Proc, errors::Error> {
+    let child = command("python3", env).args(#[MOCK, kind, log]).stdout(Stdio::Piped).spawn()?
+    let ready = child.read_stdout_line().unwrap_or(None).unwrap_or("").trim()
+    let mut process = Proc::new(child)
+    if ready != "ready" {
+        process.stop()
+        return Err(errors::new(f"The {kind} mock did not start"))
+    }
+    Ok(process)
+}
+
+/// The argument lists of every logged call to `method`, oldest first, each
+/// rendered as `canonical` renders JSON.
+pub fn called(log: String, method: String) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(log) else { return #[] }
+    let mut found = #[]
+    for line in text.split("\n") {
+        let Ok(entry) = json::parse(line) else { continue }
+        if json::as_str(json::at(entry, 0)) == Some(method) {
+            found.push(json::render(json::at(entry, 1)))
+        }
+    }
+    found
+}
+
+/// `text` as compact JSON with object keys sorted, so two spellings of one
+/// document read the same.
+pub fn canonical(text: String) -> String {
+    match json::parse(text) {
+        Ok(value) => json::render(value)
+        Err(_) => text
+    }
+}
+
+/// Element `index` of the JSON array `text`, rendered as `canonical` renders.
+pub fn element(text: String, index: i64) -> String {
+    match json::parse(text) {
+        Ok(value) => json::render(json::at(value, index))
+        Err(_) => ""
+    }
+}

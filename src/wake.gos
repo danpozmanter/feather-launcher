@@ -1,0 +1,89 @@
+// Blocking waits for descriptors that native code owns. Each waiter runs on a
+// dedicated thread (`Isolation::Thread`), parked in poll(2) until one of its
+// descriptors is readable. An eventfd counter keeps every signal sent before
+// the wait, so a wakeup can never fall between a check and the wait.
+use std::{errors, ffi}
+
+const EFD_NONBLOCK: i32 = 0x800
+const EFD_CLOEXEC: i32 = 0x80000
+const POLLIN: i16 = 1
+const EINTR: i64 = 4
+
+#[repr(C)]
+struct PollFd {
+    fd: i32
+    events: i16
+    revents: i16
+}
+
+#[link(name = "c")]
+unsafe extern "C" {
+    fn eventfd(initial: u32, flags: i32) -> i32
+    fn read(fd: i32, value: &mut u64, len: usize) -> isize
+    fn write(fd: i32, value: &mut u64, len: usize) -> isize
+    fn poll(fds: &mut [PollFd], count: ffi::c_ulong, timeout: i32) -> i32
+    fn close(fd: i32) -> i32
+}
+
+/// A level-triggered wakeup: readable from the first `signal` until `clear`.
+#[derive(Debug, PartialEq)]
+pub struct Wake {
+    pub fd: i32
+}
+
+pub fn new() -> Result<Wake, errors::Error> {
+    let fd = unsafe { eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC) }
+    if fd < 0 { return Err(errors::new(f"Could not create a wakeup descriptor: errno {ffi::last_errno()}")) }
+    Ok(Wake { fd: fd })
+}
+
+impl Wake {
+    /// Makes the descriptor readable. The counter only fails to grow at
+    /// 2^64 - 2 pending signals, which `clear` keeps out of reach.
+    pub fn signal(&self) -> () {
+        let mut one: u64 = 1
+        unsafe { write(self.fd, &mut one, 8) }
+    }
+
+    /// Resets the counter so the descriptor waits again. An already-zero
+    /// counter answers EAGAIN, which leaves it in the same state.
+    pub fn clear(&self) -> () {
+        let mut count: u64 = 0
+        unsafe { read(self.fd, &mut count, 8) }
+    }
+
+    pub fn close(&self) -> () {
+        unsafe { close(self.fd) }
+    }
+}
+
+/// Blocks the calling thread until at least one of `fds` is readable, and
+/// answers which ones are. A hang-up or error on a descriptor counts as
+/// readable, so the caller's next read reports it.
+pub fn wait(fds: Vec<i32>) -> Result<Vec<bool>, errors::Error> {
+    let mut polled = fds.map(|fd| PollFd { fd: fd, events: POLLIN, revents: 0 })
+    loop {
+        let ready = unsafe { poll(&mut polled, polled.len() as ffi::c_ulong, -1) }
+        if ready >= 0 { break }
+        let why = ffi::last_errno()
+        if why != EINTR { return Err(errors::new(f"Could not wait for a descriptor: errno {why}")) }
+    }
+    Ok(polled.map(|p| p.revents != 0))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_signal_sent_before_the_wait_is_kept_until_cleared() {
+        let first = super::new().unwrap()
+        let second = super::new().unwrap()
+        first.signal()
+        first.signal()
+        assert_eq(super::wait(#[first.fd, second.fd]).unwrap(), #[true, false])
+        first.clear()
+        second.signal()
+        assert_eq(super::wait(#[first.fd, second.fd]).unwrap(), #[false, true])
+        first.close()
+        second.close()
+    }
+}

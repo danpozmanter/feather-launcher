@@ -1,0 +1,81 @@
+// The application catalog and its freshness check. Like KRunner's sycoca
+// timestamp check, a show compares cheap file metadata against the last scan
+// and rebuilds only when the desktop entries changed.
+use std::fs
+use std::sync::Receiver
+use gui
+use gui::UiMsg
+use gui::services::apps
+
+const ICON_SIZE: i64 = 32
+
+/// What a scan of `dirs` depends on: each `.desktop` file's path, size, and
+/// modification time. Symlinked entries (Flatpak and Snap exports) report
+/// their target's metadata.
+pub fn stamp(dirs: Vec<String>) -> Vec<(String, i64, i64)> {
+    let mut out = #[]
+    for root in dirs {
+        let mut pending = #[root]
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = fs::read_dir(dir) else { continue }
+            for e in entries {
+                if e.is_dir { pending.push(e.path); continue }
+                if !e.name.ends_with(".desktop") { continue }
+                if !e.is_symlink { out.push((e.path, e.size, e.modified_ms)); continue }
+                match fs::metadata(e.path) {
+                    Ok(m) => out.push((e.path, m.size, m.modified_unix_ms))
+                    Err(_) => out.push((e.path, -1, -1))
+                }
+            }
+        }
+    }
+    out.sort()
+    out
+}
+
+/// Loads the catalog, then rescans each time `checks` delivers a request and
+/// the desktop entries changed since the last load. Ends when `checks` closes.
+pub fn watch(mailbox: gui::Mailbox, checks: Receiver<i64>) {
+    let mut loaded = load(mailbox)
+    while let Some(_) = checks.recv() {
+        // Requests queued during a rescan are answered by one check.
+        while let Some(_) = checks.try_recv() {}
+        if stamp(apps::desktop_entry_dirs()) != loaded { loaded = load(mailbox) }
+    }
+}
+
+// The stamp is taken before the scan, so a change made during the scan is
+// found by the next check.
+fn load(mailbox: gui::Mailbox) -> Vec<(String, i64, i64)> {
+    let before = stamp(apps::desktop_entry_dirs())
+    mailbox.post(UiMsg::AppsLoaded("catalog", apps::with_icons(apps::installed(), ICON_SIZE)))
+    before
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs
+    use std::path
+
+    #[test]
+    fn stamp_changes_when_an_entry_is_added_edited_or_removed() {
+        let root = fs::temp_dir("feather-catalog").unwrap()
+        let apps = path::join(root, "applications")
+        let missing = path::join(root, "missing")
+        let dirs = #[apps, missing]
+        fs::create_dir_all(path::join(apps, "vendor")).unwrap()
+        let empty = super::stamp(dirs)
+        let file = path::join(apps, "vendor/editor.desktop")
+        fs::write(file, "[Desktop Entry]\nName=Editor\n".bytes()).unwrap()
+        let added = super::stamp(dirs)
+        assert(added != empty, "a nested entry counts")
+        fs::write(path::join(apps, "notes.txt"), "ignored".bytes()).unwrap()
+        assert_eq(super::stamp(dirs), added, "other files are ignored")
+        fs::write(file, "[Desktop Entry]\nName=Text Editor\n".bytes()).unwrap()
+        let edited = super::stamp(dirs)
+        assert(edited != added, "an edit in place counts")
+        fs::remove_file(file).unwrap()
+        assert_eq(super::stamp(dirs), empty, "a removal counts")
+        fs::remove_dir_all(root).unwrap()
+    }
+}

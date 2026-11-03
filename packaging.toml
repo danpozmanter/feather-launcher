@@ -1,0 +1,5 @@
+# What scripts/package.sh needs beyond project.toml.
+name = "Feather"
+app_id = "dev.gossamer.feather-launcher"
+comment = "Start an installed application by name"
+categories = "Utility;"

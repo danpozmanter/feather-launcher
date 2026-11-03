@@ -1,0 +1,178 @@
+// `--daemon` started from a real terminal reports startup errors there, then
+// detaches into its own session with no controlling terminal and null
+// streams, survives the terminal closing, and stays the single instance.
+use std::{env, errors, ffi, fs}
+use std::ffi::Ptr
+use std::process::Stdio
+use support
+use support::{BINARY, ensure}
+use x11
+use x11::X11
+
+const O_RDWR: i32 = 2
+const O_NOCTTY: i32 = 0x100
+const PR_SET_CHILD_SUBREAPER: i32 = 36
+const SIGTERM: i32 = 15
+// Linux `comm` holds at most 15 bytes.
+const COMM_MAX: i64 = 15
+
+#[link(name = "c")]
+unsafe extern "C" {
+    fn posix_openpt(flags: i32) -> i32
+    fn grantpt(fd: i32) -> i32
+    fn unlockpt(fd: i32) -> i32
+    fn ptsname(fd: i32) -> Option<Ptr<u8>>
+    fn close(fd: i32) -> i32
+    fn prctl(option: i32, a: u64, b: u64, c: u64, d: u64) -> i32
+    fn waitpid(pid: i32, status: &mut i32, options: i32) -> i32
+    fn getsid(pid: i32) -> i32
+    fn kill(pid: i32, sig: i32) -> i32
+    fn readlink(path: [u8], buf: Ptr<u8>, size: usize) -> isize
+}
+
+/// Runs the daemon check, adding hidden startup and native activation on
+/// the X server named by DISPLAY when `with_x11`.
+pub fn check(with_x11: bool) -> Result<(), errors::Error> {
+    support::require_no_instance()?
+    // Adopt the detached descendant, so this check reaps it after cleanup.
+    ensure(unsafe { prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == 0, "Could not become a subreaper")?
+    let folder = fs::temp_dir("feather-daemon")?
+    defer { let _ = fs::remove_dir_all(folder) }
+    let mut env = #[("SDL_VIDEO_DRIVER", "offscreen"), ("DISPLAY", ""), ("XDG_CURRENT_DESKTOP", ""), ("XDG_CONFIG_HOME", folder)]
+    let mut invalid = env
+    invalid.push(("SDL_VIDEO_DRIVER", "invalid-daemon-test"))
+    let failed = support::command(BINARY, invalid).arg("--daemon").output()?
+    ensure(failed.code != 0, "Failed GUI startup was reported as success")?
+    ensure(failed.stderr.trim() != "", "The startup error did not reach the terminal")?
+    ensure(owner().is_none(), "Failed startup retained instance ownership")?
+    let mut display: Option<(X11, u64, u64)> = None
+    if with_x11 {
+        let x = x11::connect()?
+        let previous = x.focus()
+        let competitor = x.create_window("Feather daemon test")
+        display = Some((x, competitor, previous))
+        x.take_focus(competitor)?
+        env.push(("SDL_VIDEO_DRIVER", "x11"))
+        env.push(("DISPLAY", env::var("DISPLAY").unwrap_or("")))
+    }
+    defer {
+        if let Some((x, competitor, previous)) = display {
+            x.destroy(competitor)
+            x.close(previous)
+        }
+    }
+    let master, terminal_path = open_terminal()?
+    let mut master_open = true
+    defer { if master_open { unsafe { close(master) } } }
+    let mut launcher = support::Proc::new(on_terminal(terminal_path, env)?)
+    let mut daemon: Option<i64> = None
+    defer {
+        launcher.stop()
+        let pid = daemon.or(owner())
+        if let Some(pid) = pid {
+            let mut status = 0 as i32
+            unsafe {
+                kill(pid as i32, SIGTERM)
+                let _ = waitpid(pid as i32, &mut status, 0)
+            }
+        }
+    }
+    let code = launcher.wait(10_000)?
+    ensure(code == 0, f"The launching process exited {code}")?
+    support::wait_for("the daemon to own the instance", || owner().is_some())?
+    let Some(pid) = owner() else { return Err(errors::new("The daemon released the instance")) }
+    daemon = Some(pid)
+    ensure(pid != launcher.pid(), "The launching process kept the instance")?
+    let process = f"/proc/{pid}"
+    let comm = fs::read_to_string(f"{process}/comm")?.trim()
+    let name = BINARY.split("/").last().unwrap_or(BINARY)
+    ensure(comm == name.substring(0, name.byte_len().min(COMM_MAX)), f"The daemon lost its executable name: {comm}")?
+    let command = fs::read_to_string(f"{process}/cmdline")?.split("\0")
+    ensure(command[0] == fs::canonicalize(BINARY)?, f"The daemon command uses the procfs alias: {command[0]}")?
+    if let Some((x, competitor, _)) = display {
+        ensure(x.focus() == competitor, "Daemon startup took focus")?
+        ensure(x.windows_of(pid).len() == 0, "Daemon startup showed a window")?
+    }
+    ensure(unsafe { getsid(pid as i32) } as i64 == pid, "The daemon did not create a new session")?
+    let stat = fs::read_to_string(f"{process}/stat")?
+    let Some(end) = stat.rfind(") ") else { return Err(errors::new("Unreadable /proc stat")) }
+    let fields = stat.substring(end + 2, stat.byte_len()).split(" ")
+    ensure(fields[4] == "0", "The daemon still has a controlling terminal")?
+    for descriptor in 0..3 {
+        let target = link(f"{process}/fd/{descriptor}")
+        ensure(target == "/dev/null", f"Daemon descriptor {descriptor} is {target}")?
+    }
+    // Closing the launching terminal must not hang up the daemon.
+    unsafe { close(master) }
+    master_open = false
+    support::pause(300)
+    ensure(owner() == Some(pid), "Closing the terminal stopped Feather")?
+    let repeated = support::command(BINARY, env).arg("--daemon").output()?
+    ensure(repeated.code == 0, f"A repeated --daemon exited {repeated.code}: {repeated.stderr}")?
+    ensure(owner() == Some(pid), "A repeated daemon launch created another instance")?
+    if let Some((x, competitor, _)) = display {
+        ensure(x.focus() == competitor, "Repeating --daemon raised the existing window")?
+    }
+    support::activate(env)?
+    ensure(owner() == Some(pid), "Activation replaced the daemon")?
+    if let Some((x, _, _)) = display {
+        support::wait_for("the daemon's window to take focus", || {
+            let focused = x.focus()
+            focused > 1 && x.property(focused, "_NET_WM_PID") == #[pid as u64]
+        })?
+    }
+    let extra = if with_x11 { ", hidden X11 startup and native activation" } else { "" }
+    println(f"PASS: daemon startup errors, detached session and streams, terminal close, and single-instance activation{extra}")
+    Ok(())
+}
+
+// A new pseudo-terminal: its master descriptor and the terminal's path.
+fn open_terminal() -> Result<(i32, String), errors::Error> {
+    let master = unsafe { posix_openpt(O_RDWR | O_NOCTTY) }
+    ensure(master >= 0, f"posix_openpt failed: errno {ffi::last_errno()}")?
+    ensure(unsafe { grantpt(master) } == 0 && unsafe { unlockpt(master) } == 0, "Could not unlock the pseudo-terminal")?
+    let Some(name) = unsafe { ptsname(master) } else { return Err(errors::new("ptsname failed")) }
+    Ok((master, unsafe { ffi::read_cstr(name) }?))
+}
+
+// Starts `feather-launcher --daemon` as a session leader whose controlling
+// terminal and standard streams are the terminal at `path`.
+fn on_terminal(path: String, env: Vec<(String, String)>) -> Result<std::process::Child, errors::Error> {
+    let stream = || fs::OpenOptions::new().read(true).write(true).open(path)
+    let child = support::command(BINARY, env).arg("--daemon").stdin(Stdio::File(stream()?)).stdout(Stdio::File(stream()?)).stderr(Stdio::File(stream()?)).new_session().controlling_terminal(0).spawn()?
+    Ok(child)
+}
+
+// The pid holding Feather's instance socket, found through procfs.
+fn owner() -> Option<i64> {
+    let address = "@" + support::instance_address()
+    let table = fs::read_to_string("/proc/net/unix").ok()?
+    let mut inode = ""
+    for line in table.split("\n") {
+        let fields = line.split(" ").filter(|f| f != "")
+        if fields.len() >= 8 && fields[fields.len() - 1] == address {
+            inode = fields[6]
+            break
+        }
+    }
+    if inode == "" { return None }
+    let target = f"socket:[{inode}]"
+    for entry in fs::read_dir("/proc").ok()? {
+        let Some(pid) = entry.path.split("/").last().unwrap_or("").to_i64() else { continue }
+        let Ok(descriptors) = fs::read_dir(entry.path + "/fd") else { continue }
+        for descriptor in descriptors {
+            if link(descriptor.path) == target { return Some(pid) }
+        }
+    }
+    None
+}
+
+// Where the symbolic link at `path` points, or "" when it cannot be read.
+fn link(path: String) -> String {
+    let Ok(name) = ffi::cstring(path) else { return "" }
+    let buffer: Ptr<u8> = unsafe { ffi::alloc(4096) }
+    let n = unsafe { readlink(name, buffer, 4096) }
+    let target = if n > 0 { String::from_utf8(unsafe { ffi::read_bytes(buffer, n as i64) }).unwrap_or("") } else { "" }
+    unsafe { ffi::free(buffer) }
+    target
+}

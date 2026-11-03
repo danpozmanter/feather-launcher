@@ -1,0 +1,62 @@
+// Re-exec before starting GUI or worker threads. A fresh session and null
+// standard streams make the child independent of its launching terminal.
+use std::{env, errors, ffi, fs}
+use std::process::{Command, Stdio}
+
+const CHILD_FLAG: String = "--daemon-child"
+const READY: String = "ready"
+
+#[link(name = "c")]
+unsafe extern "C" {
+    fn open(path: [u8], flags: i32) -> i32
+    fn dup(fd: i32) -> i32
+    fn dup2(source: i32, destination: i32) -> i32
+    fn close(fd: i32) -> i32
+    fn write(fd: i32, data: [u8], length: usize) -> isize
+}
+
+pub fn is_child() -> bool { env::args().contains(CHILD_FLAG) }
+
+pub fn start() -> Result<(), errors::Error> {
+    // Executing the procfs link itself names the process "exe" in monitors.
+    let executable = fs::canonicalize("/proc/self/exe")?
+    let child = Command::new(executable).arg(CHILD_FLAG).new_session()
+        .stdin(Stdio::Null).stdout(Stdio::Piped).stderr(Stdio::Piped).spawn()?
+    let answer = child.read_stdout_line()?
+    if let Some(line) = answer {
+        if line.trim() == READY { return Ok(()) }
+        let _ = child.kill()
+        let _ = child.wait()
+        return Err(errors::new("Feather's background process sent an invalid startup response"))
+    }
+    // An existing instance needs no GUI startup, so it can simply exit zero.
+    let status = child.wait()?
+    if status == 0 { return Ok(()) }
+    let detail = child.read_stderr().trim()
+    Err(errors::new(f"Could not start Feather in the background (exit {status}): {detail}"))
+}
+
+// The parent waits for this handshake, so startup failures reach the terminal
+// instead of being silently discarded when standard streams are detached.
+pub fn ready() -> Result<(), errors::Error> {
+    if !is_child() { return Ok(()) }
+    let path = ffi::cstring("/dev/null")?
+    let signal = unsafe { dup(1) }
+    if signal < 0 { return Err(errors::new("Could not open the daemon startup channel")) }
+    let null = unsafe { open(path, 2) }
+    if null < 0 {
+        unsafe { close(signal) }
+        return Err(errors::new("Could not open /dev/null for the daemon"))
+    }
+    let output = unsafe { dup2(null, 1) }
+    let error = unsafe { dup2(null, 2) }
+    unsafe { close(null) }
+    if output < 0 || error < 0 {
+        unsafe { close(signal) }
+        return Err(errors::new("Could not detach the daemon's standard streams"))
+    }
+    let sent = unsafe { write(signal, "ready\n".bytes(), 6) }
+    unsafe { close(signal) }
+    if sent != 6 { return Err(errors::new("Could not acknowledge daemon startup")) }
+    Ok(())
+}

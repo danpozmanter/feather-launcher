@@ -1,0 +1,247 @@
+// The XDG desktop portal's GlobalShortcuts interface: how a Wayland
+// compositor other than KWin lends an application a desktop-wide shortcut.
+// The desktop has the last word on the key; Feather proposes its binding as
+// the preferred trigger and reports the one the desktop assigned.
+use std::errors
+use gui
+use bus
+use bus::{Bus, Value}
+use windowing::Key
+
+const PORTAL: String = "org.freedesktop.portal.Desktop"
+const OBJECT: String = "/org/freedesktop/portal/desktop"
+const SHORTCUTS: String = "org.freedesktop.portal.GlobalShortcuts"
+const REQUEST: String = "org.freedesktop.portal.Request"
+const SESSION: String = "org.freedesktop.portal.Session"
+const REGISTRY: String = "org.freedesktop.host.portal.Registry"
+const ACTION: String = "launch"
+
+/// What a portal signal means for Feather.
+#[derive(Debug, PartialEq)]
+pub enum Event {
+    /// The launch shortcut fired; the string is the activation token the
+    /// desktop sent with it, or "".
+    Activated(String)
+    Deactivated
+    /// The desktop assigned the shortcut; the string describes its key, or is
+    /// "" when the desktop left it without one for now.
+    Bound(String)
+    /// The desktop refused or the user declined the binding.
+    Failed(String)
+    /// The user changed the key in the desktop's settings.
+    Changed(String)
+    /// The session exists; `request_bind` asks for the shortcut next.
+    Created
+    Unrelated
+}
+
+#[derive(Debug, PartialEq)]
+enum Stage {
+    Idle
+    Creating
+    Binding
+}
+
+/// A connection's portal state: at most one shortcut session, and the
+/// request the portal still owes an answer for.
+#[derive(Debug, PartialEq)]
+pub struct Portal {
+    session: String
+    pending: String
+    stage: Stage
+    trigger: String
+    serial: i64
+}
+
+/// Subscribes `b` to the portal's signals. `app_id` names Feather to the
+/// portal, which keys a host application's stored shortcuts by it.
+pub fn open(b: Bus, app_id: String) -> Result<Portal, errors::Error> {
+    // The registry only exists on xdg-desktop-portal 1.19 and later; older
+    // portals identify the application from its process and need no call.
+    let _ = b.call(PORTAL, OBJECT, REGISTRY, "Register", #[Value::Str(app_id), bus::dict(#[])])
+    b.add_match(f"type='signal',interface='{REQUEST}',member='Response'")?
+    b.add_match(f"type='signal',interface='{SHORTCUTS}'")?
+    Ok(Portal { session: String::new(), pending: String::new(), stage: Stage::Idle, trigger: String::new(), serial: 0 })
+}
+
+/// The XDG shortcuts-specification trigger for a binding in
+/// `Shortcut::parse` text form, such as `CTRL+space`.
+pub fn trigger(text: String) -> Option<String> {
+    let sym, _ = crate::hotkey::bindable(text)?
+    let s = gui::Shortcut::parse(text)?.strokes[0]
+    let key = match s.key {
+        Key::Space => "space"
+        Key::Tab => "Tab"
+        Key::Return => "Return"
+        Key::Escape => "Escape"
+        Key::Backspace => "BackSpace"
+        Key::Delete => "Delete"
+        Key::Insert => "Insert"
+        Key::Home => "Home"
+        Key::End => "End"
+        Key::PageUp => "Page_Up"
+        Key::PageDown => "Page_Down"
+        Key::PrintScreen => "Print"
+        Key::Pause => "Pause"
+        Key::ScrollLock => "Scroll_Lock"
+        _ => {
+            // Letters and digits are keysyms 0x30-0x7a, named by their
+            // lowercase labels; F-keys (from 0xffbe) keep theirs.
+            let label = gui::KeyStroke::new(s.key).label()
+            if sym >= 0xffbe { label } else { label.to_lowercase() }
+        }
+    }
+    let mut parts = #[]
+    if s.ctrl || s.primary { parts.push("CTRL") }
+    if s.alt { parts.push("ALT") }
+    if s.shift { parts.push("SHIFT") }
+    if s.meta { parts.push("LOGO") }
+    parts.push(key)
+    Some(parts.join("+"))
+}
+
+fn description(shortcuts: Option<Value>) -> String {
+    let Some(Value::Array(_, items)) = shortcuts else { return String::new() }
+    for item in items {
+        let Value::Struct(fields) = item else { continue }
+        if fields.len() == 2 && fields[0] == Value::Str(ACTION) {
+            return bus::lookup(fields[1], "trigger_description").and_then(|v| bus::text(v)).unwrap_or(String::new())
+        }
+    }
+    String::new()
+}
+
+impl Portal {
+    fn token(&mut self) -> String {
+        self.serial += 1
+        f"feather{self.serial}"
+    }
+
+    /// Whether a session holds the shortcut or one is being set up.
+    pub fn active(&self) -> bool {
+        self.session != "" || self.stage != Stage::Idle
+    }
+
+    /// Ends the current session, which releases its shortcut.
+    pub fn close(&mut self, b: Bus) -> Result<(), errors::Error> {
+        let session = self.session
+        self.session = String::new()
+        self.pending = String::new()
+        self.stage = Stage::Idle
+        if session != "" { b.call(PORTAL, session, SESSION, "Close", #[])? }
+        Ok(())
+    }
+
+    /// Replaces the session with one that asks for `text`; "" only closes it.
+    /// The outcome arrives later as a `Bound` or `Failed` event.
+    pub fn bind(&mut self, b: Bus, text: String) -> Result<(), errors::Error> {
+        self.close(b)?
+        if text == "" { return Ok(()) }
+        let Some(t) = trigger(text) else { return Err(errors::new(f"The desktop cannot bind {text}")) }
+        let options = bus::dict(#[("handle_token", Value::Str(self.token())), ("session_handle_token", Value::Str(self.token()))])
+        let reply = b.call(PORTAL, OBJECT, SHORTCUTS, "CreateSession", #[options])?
+        let Some(request) = reply.first().and_then(|v| bus::text(v)) else { return Err(errors::new("Invalid portal CreateSession reply")) }
+        self.pending = request
+        self.stage = Stage::Creating
+        self.trigger = t
+        Ok(())
+    }
+
+    /// Asks the new session for the launch shortcut, after `Event::Created`.
+    pub fn request_bind(&mut self, b: Bus) -> Result<(), errors::Error> {
+        let shortcut = Value::Struct(#[Value::Str(ACTION), bus::dict(#[
+            ("description", Value::Str("Show Feather")), ("preferred_trigger", Value::Str(self.trigger))
+        ])])
+        let options = bus::dict(#[("handle_token", Value::Str(self.token()))])
+        let reply = b.call(PORTAL, OBJECT, SHORTCUTS, "BindShortcuts", #[Value::Path(self.session), Value::Array("(sa{sv})", #[shortcut]), Value::Str(""), options])?
+        let Some(request) = reply.first().and_then(|v| bus::text(v)) else { return Err(errors::new("Invalid portal BindShortcuts reply")) }
+        self.pending = request
+        self.stage = Stage::Binding
+        Ok(())
+    }
+
+    fn respond(&mut self, args: Vec<Value>) -> Event {
+        let code = match args.first() { Some(Value::U32(n)) => n, _ => 2 }
+        let results = if args.len() > 1 { args[1] } else { bus::dict(#[]) }
+        let stage = self.stage
+        self.pending = String::new()
+        self.stage = Stage::Idle
+        if code != 0 { return Event::Failed(if code == 1 { "the binding was declined" } else { "the desktop refused the binding" }) }
+        match stage {
+            Stage::Creating => {
+                let Some(session) = bus::lookup(results, "session_handle").and_then(|v| bus::text(v)) else {
+                    return Event::Failed("the portal answered without a session")
+                }
+                self.session = session
+                Event::Created
+            }
+            Stage::Binding => Event::Bound(description(bus::lookup(results, "shortcuts")))
+            Stage::Idle => Event::Unrelated
+        }
+    }
+
+    /// Advances the session state on a portal signal and says what it meant.
+    /// After `Failed`, the caller closes the session.
+    pub fn event(&mut self, s: bus::Signal) -> Event {
+        if s.interface == REQUEST && s.member == "Response" && self.pending != "" && s.path == self.pending {
+            return self.respond(s.args)
+        }
+        if s.interface != SHORTCUTS || self.session == "" || s.args.first() != Some(Value::Path(self.session)) {
+            return Event::Unrelated
+        }
+        if s.member == "ShortcutsChanged" && s.args.len() == 2 { return Event::Changed(description(Some(s.args[1]))) }
+        if s.args.len() < 2 || s.args[1] != Value::Str(ACTION) { return Event::Unrelated }
+        if s.member == "Activated" {
+            let options = if s.args.len() > 3 { s.args[3] } else { bus::dict(#[]) }
+            return Event::Activated(bus::lookup(options, "activation_token").and_then(|v| bus::text(v)).unwrap_or(String::new()))
+        }
+        if s.member == "Deactivated" { return Event::Deactivated }
+        Event::Unrelated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bus
+    use bus::Value
+
+    #[test]
+    fn triggers_follow_the_shortcuts_specification() {
+        assert_eq(super::trigger("Ctrl+Space"), Some("CTRL+space"))
+        assert_eq(super::trigger("Ctrl+Alt+T"), Some("CTRL+ALT+t"))
+        assert_eq(super::trigger("Super+F12"), Some("LOGO+F12"))
+        assert_eq(super::trigger("Ctrl+PageUp"), Some("CTRL+Page_Up"))
+        assert_eq(super::trigger("Ctrl+F"), Some("CTRL+f"))
+        assert_eq(super::trigger("Ctrl+7"), Some("CTRL+7"))
+        assert_eq(super::trigger("T"), None)
+    }
+
+    #[test]
+    fn a_bound_session_reports_presses_with_their_token() {
+        let mut p = super::Portal { session: "/s/1", pending: "", stage: super::Stage::Idle, trigger: "CTRL+space", serial: 0 }
+        let options = bus::dict(#[("activation_token", Value::Str("tok"))])
+        let press = bus::Signal { path: super::OBJECT, interface: super::SHORTCUTS, member: "Activated", args: #[Value::Path("/s/1"), Value::Str("launch"), Value::U64(9), options] }
+        assert_eq(p.event(press), super::Event::Activated("tok"))
+        let other = bus::Signal { path: super::OBJECT, interface: super::SHORTCUTS, member: "Activated", args: #[Value::Path("/s/2"), Value::Str("launch"), Value::U64(9), bus::dict(#[])] }
+        assert_eq(p.event(other), super::Event::Unrelated)
+    }
+
+    #[test]
+    fn a_create_response_opens_the_session_for_binding() {
+        let mut p = super::Portal { session: "", pending: "/r/1", stage: super::Stage::Creating, trigger: "CTRL+space", serial: 1 }
+        let response = bus::Signal { path: "/r/1", interface: super::REQUEST, member: "Response", args: #[Value::U32(0), bus::dict(#[("session_handle", Value::Str("/s/1"))])] }
+        assert_eq(p.event(response), super::Event::Created)
+        assert(p.active())
+        let declined = bus::Signal { path: "/r/9", interface: super::REQUEST, member: "Response", args: #[Value::U32(1), bus::dict(#[])] }
+        assert_eq(p.event(declined), super::Event::Unrelated)
+    }
+
+    #[test]
+    fn a_bind_response_names_the_assigned_key() {
+        let mut p = super::Portal { session: "/s/1", pending: "/r/2", stage: super::Stage::Binding, trigger: "CTRL+space", serial: 2 }
+        let shortcuts = Value::Array("(sa{sv})", #[Value::Struct(#[Value::Str("launch"), bus::dict(#[("trigger_description", Value::Str("Ctrl+Space"))])])])
+        let response = bus::Signal { path: "/r/2", interface: super::REQUEST, member: "Response", args: #[Value::U32(0), bus::dict(#[("shortcuts", shortcuts)])] }
+        assert_eq(p.event(response), super::Event::Bound("Ctrl+Space"))
+        assert(p.active())
+    }
+}

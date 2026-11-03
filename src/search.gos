@@ -1,0 +1,44 @@
+// Names use ordered fuzzy matching. Metadata supplies deliberate aliases,
+// rather than arbitrary substrings hidden in comments or generic names.
+use std::unicode
+use gui::services::apps::AppEntry
+use gui::widgets::completion::{match_label, MatchMode}
+
+fn compact(text: String) -> String {
+    unicode::fold_case(text).split_whitespace().join("")
+}
+
+fn alias_matches(alias: String, query: String) -> bool {
+    let mut words = #[compact(alias)]
+    for word in alias.split_whitespace() { words.push(compact(word)) }
+    words.iter().any(|word| word == query || (query.len() >= 3 && word.starts_with(query)))
+}
+
+fn score(entry: AppEntry, query: String) -> f64 {
+    let fuzzy, ranges = match_label(entry.name, query, MatchMode::Fuzzy)
+    if !ranges.is_empty() {
+        let prefix = match_label(entry.name, query, MatchMode::Prefix).1
+        let substring = match_label(entry.name, query, MatchMode::Substring).1
+        let priority = if !prefix.is_empty() { 1000.0 } else if !substring.is_empty() { 500.0 } else { 100.0 }
+        return priority + fuzzy.max(0.0)
+    }
+    let mut aliases = entry.keywords
+    aliases.push(entry.generic_name)
+    if aliases.iter().any(|alias| alias_matches(alias, query)) { 1.0 } else { 0.0 }
+}
+
+pub fn highlights(label: String, query: String) -> Vec<(i64, i64)> {
+    match_label(label, compact(query), MatchMode::Fuzzy).1
+}
+
+pub fn find(entries: Vec<AppEntry>, query: String, limit: i64) -> Vec<AppEntry> {
+    let query = compact(query)
+    if query.is_empty() || limit <= 0 { return #[] }
+    let mut found = #[]
+    for entry in entries {
+        let rank = score(entry, query)
+        if rank > 0.0 { found.push((rank, unicode::fold_case(entry.name), entry)) }
+    }
+    found.sort_by_key(|entry| (Reverse(entry.0), entry.1, entry.2.id))
+    found.iter().take(limit).map(|entry| entry.2).collect()
+}

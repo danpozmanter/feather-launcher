@@ -1,0 +1,39 @@
+/* Feather Launcher: bronze and orange, after the app icon. */
+
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color: #a8642a;
+  --md-primary-fg-color--light: #c47e3f;
+  --md-primary-fg-color--dark: #7a4a22;
+  --md-primary-bg-color: #fff;
+  --md-accent-fg-color: #e07b1f;
+  --md-typeset-a-color: #9a561f;
+  --md-code-bg-color: #fff4e6;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-hue: 28;
+  --md-primary-fg-color: #6b3f1c;
+  --md-primary-fg-color--light: #8a5326;
+  --md-primary-fg-color--dark: #4f2e14;
+  --md-primary-bg-color: #fbeedd;
+  --md-accent-fg-color: #f2a050;
+  --md-typeset-a-color: #f2a050;
+}
+
+.hero {
+  text-align: center;
+  padding: 1rem 0 0.5rem;
+}
+
+.hero img {
+  width: 7rem;
+}
+
+.hero h1 {
+  margin-bottom: 0.4rem;
+}
+
+.hero .tagline {
+  font-size: 1.15rem;
+  opacity: 0.85;
+}

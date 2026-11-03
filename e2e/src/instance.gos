@@ -1,0 +1,80 @@
+// Concurrent launches leave exactly one owner, a duplicate launch activates
+// it and exits, and a killed owner's socket is reclaimed by the kernel. With
+// the KDE mock, startup removes only the conflicting desktop shortcut.
+use std::{env, errors, fs}
+use support
+use support::{Proc, ensure}
+
+/// Runs the instance check, with the mock KDE shortcut service when `desktop`.
+pub fn check(desktop: bool) -> Result<(), errors::Error> {
+    support::require_no_instance()?
+    let folder = fs::temp_dir("feather-instance")?
+    defer { let _ = fs::remove_dir_all(folder) }
+    let log = f"{folder}/calls.jsonl"
+    let mut env = #[("SDL_VIDEO_DRIVER", "offscreen"), ("XDG_CONFIG_HOME", folder)]
+    let mut services: Vec<Proc> = #[]
+    defer {
+        for i in 0..services.len() { services[i].stop() }
+    }
+    if desktop {
+        ensure(env::var("DISPLAY").unwrap_or("") != "", "--desktop-mock requires DISPLAY")?
+        let bus = support::private_bus(folder)?
+        services.push(bus.daemon)
+        env.push(("DBUS_SESSION_BUS_ADDRESS", bus.address))
+        env.push(("XDG_CURRENT_DESKTOP", "KDE"))
+        services.push(support::mock("kde", log, env)?)
+    } else {
+        env.push(("DISPLAY", ""))
+    }
+    let mut children: Vec<Proc> = #[]
+    defer {
+        for i in 0..children.len() { children[i].stop() }
+    }
+    for _ in 0..12 {
+        children.push(support::launch(env)?)
+    }
+    support::wait_for("all but one launch to exit", || running(&mut children).len() == 1)?
+    support::pause(300)
+    let survivors = running(&mut children)
+    ensure(survivors.len() == 1, f"{survivors.len()} launches kept running")?
+    for i in 0..children.len() {
+        if i != survivors[0] {
+            let code = children[i].wait()?
+            if code != 0 { return Err(errors::new(f"A second launch exited {code}: {children[i].errors()}")) }
+        }
+    }
+    let primary = survivors[0]
+    if desktop {
+        support::wait_for("the conflicting KDE shortcut's release", || support::called(log, "setForeignShortcutKeys").len() > 0)?
+        // The conflicting action keeps its other key.
+        let released = support::called(log, "setForeignShortcutKeys")
+        let wanted = support::canonical("[[\"test\", \"action\", \"Test\", \"Action\"], [[[777, 888, 0, 0]]]]")
+        ensure(released == #[wanted], f"Unexpected release: {released}")?
+    }
+    // A duplicate exits successfully while the owner survives.
+    children.push(support::launch(env)?)
+    let duplicate = children.len() - 1
+    let code = children[duplicate].wait()?
+    if code != 0 { return Err(errors::new(f"A duplicate launch exited {code}: {children[duplicate].errors()}")) }
+    ensure(children[primary].running(), "The owner exited when a duplicate launched")?
+    // SIGKILL exercises the kernel's socket cleanup, without shutdown code.
+    children[primary].stop()
+    children.push(support::launch(env)?)
+    let replacement = children.len() - 1
+    support::pause(500)
+    if !children[replacement].running() {
+        return Err(errors::new(f"The replacement did not take over: {children[replacement].errors()}"))
+    }
+    let extra = if desktop { ", KDE conflict removal preserving other bindings" } else { "" }
+    println(f"PASS: concurrent launches, duplicate activation, crash recovery{extra}")
+    Ok(())
+}
+
+// The indexes of the processes still running.
+fn running(processes: &mut Vec<Proc>) -> Vec<i64> {
+    let mut alive = #[]
+    for i in 0..processes.len() {
+        if processes[i].running() { alive.push(i) }
+    }
+    alive
+}

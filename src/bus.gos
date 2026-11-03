@@ -1,0 +1,423 @@
+// A small D-Bus client over libdbus-1: blocking method calls and a queue of
+// incoming signals on a private session-bus connection. The connection's
+// descriptor joins the caller's own poll(2), so a watcher thread sleeps until
+// a signal or one of its wakeups arrives.
+use std::{errors, ffi}
+use std::ffi::Ptr
+
+const BUS_SESSION: ffi::c_int = 0
+const TIMEOUT_DEFAULT: ffi::c_int = -1
+const MESSAGE_SIGNAL: ffi::c_int = 4
+
+const T_BYTE: ffi::c_int = 121
+const T_BOOLEAN: ffi::c_int = 98
+const T_INT16: ffi::c_int = 110
+const T_UINT16: ffi::c_int = 113
+const T_INT32: ffi::c_int = 105
+const T_UINT32: ffi::c_int = 117
+const T_INT64: ffi::c_int = 120
+const T_UINT64: ffi::c_int = 116
+const T_DOUBLE: ffi::c_int = 100
+const T_STRING: ffi::c_int = 115
+const T_OBJECT_PATH: ffi::c_int = 111
+const T_SIGNATURE: ffi::c_int = 103
+const T_ARRAY: ffi::c_int = 97
+const T_VARIANT: ffi::c_int = 118
+const T_STRUCT: ffi::c_int = 114
+const T_DICT_ENTRY: ffi::c_int = 101
+
+// sizeof(DBusMessageIter) and sizeof(DBusError) on LP64 Linux, in u64 words.
+const ITER_WORDS: i64 = 9
+const ERROR_WORDS: i64 = 4
+// DBusBasicValue is 8 bytes; get_basic writes at most that.
+const BASIC_WORDS: i64 = 1
+
+/// A D-Bus value, typed as it travels on the bus.
+#[derive(Debug, PartialEq)]
+pub enum Value {
+    Bool(bool)
+    Byte(i64)
+    I32(i64)
+    U32(i64)
+    I64(i64)
+    /// Carried in an i64 with the same bits.
+    U64(i64)
+    Double(f64)
+    Str(String)
+    Path(String)
+    /// The element signature and the elements, so an empty array keeps its type.
+    Array(String, Vec<Value>)
+    Struct(Vec<Value>)
+    /// A dictionary entry, only as an element of an `a{..}` array.
+    Entry(Value, Value)
+    Variant(Value)
+    /// A type this client does not decode, such as a Unix descriptor.
+    Other
+}
+
+/// A signal the bus delivered.
+#[derive(Debug, PartialEq)]
+pub struct Signal {
+    pub path: String
+    pub interface: String
+    pub member: String
+    pub args: Vec<Value>
+}
+
+#[link(name = "dbus-1")]
+unsafe extern "C" {
+    type Connection
+    type Message
+
+    fn dbus_error_init(error: Ptr<u64>)
+    fn dbus_error_is_set(error: Ptr<u64>) -> u32
+    fn dbus_error_free(error: Ptr<u64>)
+    fn dbus_bus_get_private(kind: ffi::c_int, error: Ptr<u64>) -> Option<Ptr<Connection>>
+    fn dbus_bus_get_unique_name(conn: Ptr<Connection>) -> Option<Ptr<u8>>
+    fn dbus_bus_add_match(conn: Ptr<Connection>, rule: [u8], error: Ptr<u64>)
+    fn dbus_connection_set_exit_on_disconnect(conn: Ptr<Connection>, exit: u32)
+    fn dbus_connection_get_unix_fd(conn: Ptr<Connection>, fd: &mut ffi::c_int) -> u32
+    fn dbus_connection_send_with_reply_and_block(conn: Ptr<Connection>, msg: Ptr<Message>, timeout: ffi::c_int, error: Ptr<u64>) -> Option<Ptr<Message>>
+    fn dbus_connection_read_write(conn: Ptr<Connection>, timeout: ffi::c_int) -> u32
+    fn dbus_connection_pop_message(conn: Ptr<Connection>) -> Option<Ptr<Message>>
+    fn dbus_connection_close(conn: Ptr<Connection>)
+    fn dbus_connection_unref(conn: Ptr<Connection>)
+    fn dbus_message_new_method_call(dest: [u8], path: [u8], iface: [u8], method: [u8]) -> Option<Ptr<Message>>
+    fn dbus_message_unref(msg: Ptr<Message>)
+    fn dbus_message_get_type(msg: Ptr<Message>) -> ffi::c_int
+    fn dbus_message_get_path(msg: Ptr<Message>) -> Option<Ptr<u8>>
+    fn dbus_message_get_interface(msg: Ptr<Message>) -> Option<Ptr<u8>>
+    fn dbus_message_get_member(msg: Ptr<Message>) -> Option<Ptr<u8>>
+    fn dbus_message_iter_init_append(msg: Ptr<Message>, iter: Ptr<u64>)
+    fn dbus_message_iter_append_basic(iter: Ptr<u64>, kind: ffi::c_int, value: Ptr<u64>) -> u32
+    fn dbus_message_iter_open_container(iter: Ptr<u64>, kind: ffi::c_int, signature: Option<Ptr<u8>>, sub: Ptr<u64>) -> u32
+    fn dbus_message_iter_close_container(iter: Ptr<u64>, sub: Ptr<u64>) -> u32
+    fn dbus_message_iter_init(msg: Ptr<Message>, iter: Ptr<u64>) -> u32
+    fn dbus_message_iter_get_arg_type(iter: Ptr<u64>) -> ffi::c_int
+    fn dbus_message_iter_get_basic(iter: Ptr<u64>, value: Ptr<u64>)
+    fn dbus_message_iter_get_signature(iter: Ptr<u64>) -> Option<Ptr<u8>>
+    fn dbus_message_iter_recurse(iter: Ptr<u64>, sub: Ptr<u64>)
+    fn dbus_message_iter_next(iter: Ptr<u64>) -> u32
+    fn dbus_free(memory: Ptr<u8>)
+}
+
+/// The D-Bus type signature of `v`.
+pub fn signature(v: Value) -> String {
+    match v {
+        Value::Bool(_) => "b"
+        Value::Byte(_) => "y"
+        Value::I32(_) => "i"
+        Value::U32(_) => "u"
+        Value::I64(_) => "x"
+        Value::U64(_) => "t"
+        Value::Double(_) => "d"
+        Value::Str(_) => "s"
+        Value::Path(_) => "o"
+        Value::Array(element, _) => "a" + element
+        Value::Struct(items) => "(" + items.map(signature).join("") + ")"
+        Value::Entry(key, value) => "{" + signature(key) + signature(value) + "}"
+        Value::Variant(_) => "v"
+        Value::Other => ""
+    }
+}
+
+/// An `a{sv}` dictionary of string keys and variant values.
+pub fn dict(entries: Vec<(String, Value)>) -> Value {
+    Value::Array("{sv}", entries.map(|(k, v)| Value::Entry(Value::Str(k), Value::Variant(v))))
+}
+
+/// The value under `key` in an `a{sv}` dictionary, unwrapped from its variant.
+pub fn lookup(d: Value, key: String) -> Option<Value> {
+    let Value::Array(_, entries) = d else { return None }
+    for entry in entries {
+        if let Value::Entry(Value::Str(k), Value::Variant(v)) = entry && k == key { return Some(v) }
+    }
+    None
+}
+
+/// The text of a string, object path, or variant holding one.
+pub fn text(v: Value) -> Option<String> {
+    match v {
+        Value::Str(s) | Value::Path(s) => Some(s)
+        Value::Variant(inner) => text(inner)
+        _ => None
+    }
+}
+
+fn words(count: i64) -> Ptr<u64> {
+    // alloc answers zeroed C memory; libdbus initializes what it reads.
+    unsafe { ffi::alloc::<u64>(count) }
+}
+
+fn c_text(p: Option<Ptr<u8>>) -> String {
+    match p {
+        Some(p) => unsafe { ffi::read_cstr(p) }.unwrap_or(String::new())
+        None => String::new()
+    }
+}
+
+// Reads and frees a DBusError a call filled, then frees its storage.
+fn take_error(error: Ptr<u64>, context: String) -> errors::Error {
+    let name = c_text(unsafe { Ptr::<u8>::from_address(ffi::read_at::<u64>(error, 0)) })
+    let message = c_text(unsafe { Ptr::<u8>::from_address(ffi::read_at::<u64>(error, 1)) })
+    unsafe {
+        dbus_error_free(error)
+        ffi::free(error)
+    }
+    if name == "" { errors::new(context) } else { errors::new(f"{context}: {name}: {message}") }
+}
+
+fn new_error() -> Ptr<u64> {
+    let error = words(ERROR_WORDS)
+    unsafe { dbus_error_init(error) }
+    error
+}
+
+fn free_error(error: Ptr<u64>) -> () {
+    unsafe {
+        dbus_error_free(error)
+        ffi::free(error)
+    }
+}
+
+fn append_basic(iter: Ptr<u64>, kind: ffi::c_int, bits: u64) -> Result<(), errors::Error> {
+    let slot = words(BASIC_WORDS)
+    unsafe { ffi::write(slot, bits) }
+    let ok = unsafe { dbus_message_iter_append_basic(iter, kind, slot) }
+    unsafe { ffi::free(slot) }
+    if ok == 0 { return Err(errors::new("D-Bus could not append a value")) }
+    Ok(())
+}
+
+// libdbus copies the string, so its C copy is freed after the append.
+fn append_text(iter: Ptr<u64>, kind: ffi::c_int, s: String) -> Result<(), errors::Error> {
+    let bytes = unsafe { ffi::to_c_bytes(ffi::cstring(s)?) }
+    let result = append_basic(iter, kind, bytes.address())
+    unsafe { ffi::free(bytes) }
+    result
+}
+
+fn append_container(iter: Ptr<u64>, kind: ffi::c_int, contained: String, items: Vec<Value>) -> Result<(), errors::Error> {
+    let sub = words(ITER_WORDS)
+    let sig = if contained == "" { None } else { Some(unsafe { ffi::to_c_bytes(ffi::cstring(contained)?) }) }
+    let opened = unsafe { dbus_message_iter_open_container(iter, kind, sig, sub) }
+    let mut result = if opened == 0 { Err(errors::new("D-Bus could not open a container")) } else { Ok(()) }
+    if opened != 0 {
+        for item in items {
+            if result.is_ok() { result = append(sub, item) }
+        }
+        if unsafe { dbus_message_iter_close_container(iter, sub) } == 0 && result.is_ok() {
+            result = Err(errors::new("D-Bus could not close a container"))
+        }
+    }
+    if let Some(p) = sig { unsafe { ffi::free(p) } }
+    unsafe { ffi::free(sub) }
+    result
+}
+
+fn append(iter: Ptr<u64>, v: Value) -> Result<(), errors::Error> {
+    match v {
+        Value::Bool(b) => append_basic(iter, T_BOOLEAN, if b { 1 } else { 0 })
+        Value::Byte(n) => append_basic(iter, T_BYTE, (n as u8) as u64)
+        Value::I32(n) => append_basic(iter, T_INT32, (n as i32 as u32) as u64)
+        Value::U32(n) => append_basic(iter, T_UINT32, (n as u32) as u64)
+        Value::I64(n) => append_basic(iter, T_INT64, n as u64)
+        Value::U64(n) => append_basic(iter, T_UINT64, n as u64)
+        Value::Double(_) => Err(errors::new("This D-Bus client does not send doubles"))
+        Value::Str(s) => append_text(iter, T_STRING, s)
+        Value::Path(s) => append_text(iter, T_OBJECT_PATH, s)
+        Value::Array(element, items) => append_container(iter, T_ARRAY, element, items)
+        Value::Struct(items) => append_container(iter, T_STRUCT, "", items)
+        Value::Entry(key, value) => append_container(iter, T_DICT_ENTRY, "", #[key, value])
+        Value::Variant(inner) => append_container(iter, T_VARIANT, signature(inner), #[inner])
+        Value::Other => Err(errors::new("A D-Bus value has no type"))
+    }
+}
+
+// The values from `iter` to the end of its container.
+fn read_all(iter: Ptr<u64>) -> Vec<Value> {
+    let mut values = #[]
+    while unsafe { dbus_message_iter_get_arg_type(iter) } != 0 {
+        values.push(read(iter))
+        if unsafe { dbus_message_iter_next(iter) } == 0 { break }
+    }
+    values
+}
+
+fn read_inner(iter: Ptr<u64>) -> Vec<Value> {
+    let sub = words(ITER_WORDS)
+    unsafe { dbus_message_iter_recurse(iter, sub) }
+    let values = read_all(sub)
+    unsafe { ffi::free(sub) }
+    values
+}
+
+fn read(iter: Ptr<u64>) -> Value {
+    let kind = unsafe { dbus_message_iter_get_arg_type(iter) }
+    match kind {
+        T_ARRAY => {
+            let sig = unsafe { dbus_message_iter_get_signature(iter) }
+            let full = c_text(sig)
+            if let Some(p) = sig { unsafe { dbus_free(p) } }
+            Value::Array(full.substring(1, full.byte_len()), read_inner(iter))
+        }
+        T_STRUCT => Value::Struct(read_inner(iter))
+        T_DICT_ENTRY => {
+            let pair = read_inner(iter)
+            if pair.len() == 2 { Value::Entry(pair[0], pair[1]) } else { Value::Other }
+        }
+        T_VARIANT => {
+            let inner = read_inner(iter)
+            if inner.len() == 1 { Value::Variant(inner[0]) } else { Value::Other }
+        }
+        _ => read_basic(iter, kind)
+    }
+}
+
+fn read_basic(iter: Ptr<u64>, kind: ffi::c_int) -> Value {
+    let slot = words(BASIC_WORDS)
+    unsafe { dbus_message_iter_get_basic(iter, slot) }
+    let value = match kind {
+        // libdbus stores a pointer into the message, valid while it lives.
+        T_STRING | T_SIGNATURE => Value::Str(c_text(unsafe { Ptr::<u8>::from_address(ffi::read::<u64>(slot)) }))
+        T_OBJECT_PATH => Value::Path(c_text(unsafe { Ptr::<u8>::from_address(ffi::read::<u64>(slot)) }))
+        T_BOOLEAN => Value::Bool(unsafe { ffi::read::<u32>(slot.cast::<u32>()) } != 0)
+        T_BYTE => Value::Byte(unsafe { ffi::read::<u8>(slot.cast::<u8>()) } as i64)
+        T_INT16 => Value::I32(unsafe { ffi::read::<i16>(slot.cast::<i16>()) } as i64)
+        T_UINT16 => Value::U32(unsafe { ffi::read::<u16>(slot.cast::<u16>()) } as i64)
+        T_INT32 => Value::I32(unsafe { ffi::read::<i32>(slot.cast::<i32>()) } as i64)
+        T_UINT32 => Value::U32(unsafe { ffi::read::<u32>(slot.cast::<u32>()) } as i64)
+        T_INT64 => Value::I64(unsafe { ffi::read::<i64>(slot.cast::<i64>()) })
+        T_UINT64 => Value::U64(unsafe { ffi::read::<u64>(slot) } as i64)
+        T_DOUBLE => Value::Double(unsafe { ffi::read::<f64>(slot.cast::<f64>()) })
+        _ => Value::Other
+    }
+    unsafe { ffi::free(slot) }
+    value
+}
+
+fn body(msg: Ptr<Message>) -> Vec<Value> {
+    let iter = words(ITER_WORDS)
+    let values = if unsafe { dbus_message_iter_init(msg, iter) } != 0 { read_all(iter) } else { #[] }
+    unsafe { ffi::free(iter) }
+    values
+}
+
+/// A private connection to the session bus. Only one thread uses it at a time.
+#[derive(Debug, PartialEq)]
+pub struct Bus {
+    conn: Ptr<Connection>
+}
+
+/// Connects to the session bus named by `DBUS_SESSION_BUS_ADDRESS`.
+pub fn session() -> Result<Bus, errors::Error> {
+    let error = new_error()
+    let Some(conn) = unsafe { dbus_bus_get_private(BUS_SESSION, error) } else {
+        return Err(take_error(error, "Could not connect to the session bus"))
+    }
+    free_error(error)
+    // A lost bus must end the watcher, not the whole process.
+    unsafe { dbus_connection_set_exit_on_disconnect(conn, 0) }
+    Ok(Bus { conn: conn })
+}
+
+impl Bus {
+    /// This connection's unique bus name, such as `:1.42`.
+    pub fn unique_name(&self) -> String {
+        c_text(unsafe { dbus_bus_get_unique_name(self.conn) })
+    }
+
+    /// The socket to poll for incoming messages.
+    pub fn fd(&self) -> Result<i32, errors::Error> {
+        let mut fd: ffi::c_int = -1
+        if unsafe { dbus_connection_get_unix_fd(self.conn, &mut fd) } == 0 {
+            return Err(errors::new("The session bus has no descriptor"))
+        }
+        Ok(fd as i32)
+    }
+
+    /// Calls `method` and answers the reply's values. Signals that arrive
+    /// meanwhile stay queued for `signals`.
+    pub fn call(&self, dest: String, path: String, iface: String, method: String, args: Vec<Value>) -> Result<Vec<Value>, errors::Error> {
+        let Some(msg) = unsafe { dbus_message_new_method_call(ffi::cstring(dest)?, ffi::cstring(path)?, ffi::cstring(iface)?, ffi::cstring(method)?) } else {
+            return Err(errors::new("D-Bus could not create a method call"))
+        }
+        let iter = words(ITER_WORDS)
+        unsafe { dbus_message_iter_init_append(msg, iter) }
+        let mut appended = Ok(())
+        for arg in args {
+            if appended.is_ok() { appended = append(iter, arg) }
+        }
+        unsafe { ffi::free(iter) }
+        if let Err(e) = appended {
+            unsafe { dbus_message_unref(msg) }
+            return Err(e)
+        }
+        let error = new_error()
+        let reply = unsafe { dbus_connection_send_with_reply_and_block(self.conn, msg, TIMEOUT_DEFAULT, error) }
+        unsafe { dbus_message_unref(msg) }
+        let Some(reply) = reply else { return Err(take_error(error, f"{iface}.{method} failed")) }
+        free_error(error)
+        let values = body(reply)
+        unsafe { dbus_message_unref(reply) }
+        Ok(values)
+    }
+
+    /// Subscribes this connection to the signals `rule` matches.
+    pub fn add_match(&self, rule: String) -> Result<(), errors::Error> {
+        let error = new_error()
+        unsafe { dbus_bus_add_match(self.conn, ffi::cstring(rule)?, error) }
+        if unsafe { dbus_error_is_set(error) } != 0 { return Err(take_error(error, "Could not subscribe to D-Bus signals")) }
+        free_error(error)
+        Ok(())
+    }
+
+    /// Reads what the socket holds without blocking and answers every queued
+    /// signal, including those that arrived during a `call`.
+    pub fn signals(&self) -> Result<Vec<Signal>, errors::Error> {
+        if unsafe { dbus_connection_read_write(self.conn, 0) } == 0 {
+            return Err(errors::new("The session bus connection closed"))
+        }
+        let mut out = #[]
+        while let Some(msg) = unsafe { dbus_connection_pop_message(self.conn) } {
+            if unsafe { dbus_message_get_type(msg) } == MESSAGE_SIGNAL {
+                out.push(Signal {
+                    path: c_text(unsafe { dbus_message_get_path(msg) })
+                    interface: c_text(unsafe { dbus_message_get_interface(msg) })
+                    member: c_text(unsafe { dbus_message_get_member(msg) })
+                    args: body(msg)
+                })
+            }
+            unsafe { dbus_message_unref(msg) }
+        }
+        Ok(out)
+    }
+
+    pub fn close(&self) -> () {
+        unsafe {
+            dbus_connection_close(self.conn)
+            dbus_connection_unref(self.conn)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Value
+
+    #[test]
+    fn signatures_follow_the_values_nesting() {
+        let shortcut = Value::Struct(#[Value::Str("launch"), super::dict(#[("description", Value::Str("Show"))])])
+        assert_eq(super::signature(Value::Array("(sa{sv})", #[shortcut])), "a(sa{sv})")
+        assert_eq(super::signature(shortcut), "(sa{sv})")
+        assert_eq(super::signature(Value::Variant(Value::U32(1))), "v")
+    }
+
+    #[test]
+    fn dictionary_lookup_unwraps_variants() {
+        let d = super::dict(#[("session_handle", Value::Path("/s/1")), ("n", Value::U32(2))])
+        assert_eq(super::lookup(d, "session_handle"), Some(Value::Path("/s/1")))
+        assert_eq(super::lookup(d, "missing"), None)
+        assert_eq(super::text(Value::Variant(Value::Str("x"))), Some("x"))
+    }
+}

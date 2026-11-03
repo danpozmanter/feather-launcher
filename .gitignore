@@ -1,0 +1,5 @@
+# Build output and the caches `gos build` keeps beside the sources.
+target/
+.gos-cache/
+# Python bytecode from the mock desktop services in e2e/.
+__pycache__/

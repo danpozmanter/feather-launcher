@@ -1,0 +1,90 @@
+// Records Ctrl+Home through the real Settings dialog, re-records it while it
+// is the installed grab, then invokes it as the global hotkey.
+use std::{errors, fs}
+use support
+use x11
+use x11::{CONTROL_MASK, XK_ESCAPE, XK_HOME, XK_RETURN, XK_TAB, X11}
+
+/// Runs the shortcut recording check against the X server named by DISPLAY.
+pub fn check() -> Result<(), errors::Error> {
+    support::require_no_instance()?
+    let x = x11::connect()?
+    let previous = x.focus()
+    let competitor = x.create_window("Feather shortcut test")
+    defer {
+        x.destroy(competitor)
+        x.close(previous)
+    }
+    x.take_focus(competitor)?
+    let folder = fs::temp_dir("feather-shortcut")?
+    defer { let _ = fs::remove_dir_all(folder) }
+    // An empty desktop leaves the user's desktop shortcut assignments alone.
+    let env = #[("SDL_VIDEO_DRIVER", "x11"), ("XDG_CURRENT_DESKTOP", ""), ("XDG_CONFIG_HOME", folder)]
+    let mut child = support::launch(env)?
+    defer { child.stop() }
+    let pid = child.pid()
+    let launcher = x.wait_window(pid)?
+    support::wait_for("startup focus", || x.focus() == launcher)?
+    // Tab from the entry to the Settings icon, and Enter opens Settings.
+    x.stroke(XK_TAB)
+    x.stroke(XK_RETURN)
+    let settings = new_window(x, pid, #[launcher])?
+    support::wait_for("Settings focus", || x.focus() == settings)?
+    // Close is focused first; Tab wraps to Change launch.
+    x.stroke(XK_TAB)
+    x.stroke(XK_RETURN)
+    record(x, pid, launcher, settings)?
+    // Re-recording the installed hotkey must reach the capture dialog, not
+    // Feather's own global grab, which recording releases.
+    x.stroke(XK_RETURN)
+    let capture = new_window(x, pid, #[launcher, settings])?
+    support::wait_for("capture focus", || x.focus() == capture)?
+    support::wait_for("the grab's release while recording", || !x.key_grabbed(XK_HOME, CONTROL_MASK))?
+    finish(x, pid, capture, settings)?
+    // Escape closes Settings.
+    x.stroke(XK_ESCAPE)
+    support::wait_for("Settings to close", || !x.windows_of(pid).contains(settings))?
+    x.take_focus(competitor)?
+    support::wait_for("the new grab", || x.key_grabbed(XK_HOME, CONTROL_MASK))?
+    x.stroke(XK_HOME, control: true)
+    support::wait_for("the hotkey to show the launcher", || x.focus() == launcher)?
+    x.stroke(XK_ESCAPE)
+    support::wait_for("Escape to hide the launcher", || x.focus() != launcher)?
+    x.stroke(XK_HOME, control: true)
+    support::wait_for("the hotkey to show it again", || x.focus() == launcher)?
+    x.quit_shortcut()
+    let code = child.wait()?
+    if code != 0 { return Err(errors::new(f"Quitting exited {code}: {child.errors()}")) }
+    println("PASS: real Settings button, shortcut capture, Ctrl+Home, Set, global invocation, and quitting")
+    Ok(())
+}
+
+// The capture dialog just opened from Settings records Ctrl+Home.
+fn record(x: X11, pid: i64, launcher: u64, settings: u64) -> Result<(), errors::Error> {
+    let capture = new_window(x, pid, #[launcher, settings])?
+    support::wait_for("capture focus", || x.focus() == capture)?
+    finish(x, pid, capture, settings)
+}
+
+// Types Ctrl+Home into the capture dialog and confirms it with Set.
+fn finish(x: X11, pid: i64, capture: u64, settings: u64) -> Result<(), errors::Error> {
+    x.stroke(XK_HOME, control: true)
+    x.stroke(XK_RETURN)
+    support::wait_for("the capture dialog to close", || !x.windows_of(pid).contains(capture))?
+    support::wait_for("Settings focus", || x.focus() == settings)
+}
+
+// The window of `pid` that is none of `known`, once it appears.
+fn new_window(x: X11, pid: i64, known: Vec<u64>) -> Result<u64, errors::Error> {
+    let mut found = 0 as u64
+    support::wait_for("a new window", || {
+        for window in x.windows_of(pid) {
+            if !known.contains(window) {
+                found = window
+                return true
+            }
+        }
+        false
+    })?
+    Ok(found)
+}

@@ -1,0 +1,61 @@
+// The launcher takes real X11 focus on startup and on every activation, over
+// a competing window, stacks above it, hides on Escape, and quits on
+// Ctrl+Shift+Q.
+use std::{errors, fs}
+use support
+use support::ensure
+use x11
+use x11::X11
+
+/// Runs the focus check against the X server named by DISPLAY.
+pub fn check() -> Result<(), errors::Error> {
+    support::require_no_instance()?
+    let x = x11::connect()?
+    let previous = x.focus()
+    let competitor = x.create_window("Feather focus test")
+    defer {
+        x.destroy(competitor)
+        x.close(previous)
+    }
+    x.take_focus(competitor)?
+    let folder = fs::temp_dir("feather-focus")?
+    defer { let _ = fs::remove_dir_all(folder) }
+    // An empty desktop skips shortcut service changes, leaving the X11 grab.
+    let env = #[("SDL_VIDEO_DRIVER", "x11"), ("XDG_CURRENT_DESKTOP", ""), ("XDG_CONFIG_HOME", folder)]
+    let mut child = support::launch(env)?
+    defer { child.stop() }
+    let launcher = x.wait_window(child.pid())?
+    support::wait_for("startup focus", || x.focus() == launcher)?
+    support::pause(150)
+    ensure(x.focus() == launcher, "Startup focus did not persist")?
+    for _ in 0..5 {
+        x.take_focus(competitor)?
+        support::wait_for("the competitor's focus", || x.focus() == competitor)?
+        // Losing focus hides the launcher before it is activated again.
+        support::wait_for("the launcher to hide", || !x.viewable(launcher))?
+        support::activate(env)?
+        support::wait_for("activation focus", || x.focus() == launcher)?
+        support::pause(100)
+        ensure(x.focus() == launcher, "Activation focus did not persist")?
+        ensure(above(x, launcher, competitor), "The launcher is stacked below the competitor")?
+    }
+    // Escape hides it, and an activation must take focus again.
+    x.key(launcher, x11::XK_ESCAPE)
+    support::wait_for("Escape to hide the launcher", || x.focus() != launcher)?
+    support::activate(env)?
+    support::wait_for("focus after Escape", || x.focus() == launcher)?
+    x.quit_shortcut()
+    let code = child.wait()?
+    if code != 0 { return Err(errors::new(f"Quitting exited {code}: {child.errors()}")) }
+    println("PASS: real X11 startup focus, five reactivations, stacking, Escape, and Ctrl+Shift+Q")
+    Ok(())
+}
+
+// Whether `top` is stacked above `bottom`.
+fn above(x: X11, top: u64, bottom: u64) -> bool {
+    let stacking = x.property(x.root, "_NET_CLIENT_LIST_STACKING")
+    match (stacking.iter().position(|w| w == top), stacking.iter().position(|w| w == bottom)) {
+        (Some(t), Some(b)) => t > b
+        _ => false
+    }
+}

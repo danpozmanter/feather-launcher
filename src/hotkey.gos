@@ -1,0 +1,648 @@
+// The global launch shortcut, Ctrl+Space by default and rebindable in
+// Settings. On X11 it is a grab on the root window over the watcher's own X
+// connection, so the key answers whatever has focus. On Wayland the
+// compositor owns global keys and lends one through KDE's shortcut service
+// or the desktop portal. Either way the watcher sleeps in poll(2) on its
+// connection and two wakeups, so a shortcut picked in Settings takes effect
+// without a restart; `can_grab` is the check the model runs before accepting
+// a binding.
+use std::{env, errors, ffi}
+use std::ffi::Ptr
+use std::sync::Receiver
+use gui
+use app
+use bus
+use desktop
+use portal
+use wake
+use windowing::Key
+
+// An internal channel message: release the grab for recording, retaining
+// the previous binding so cancellation or a failed change can restore it.
+pub const CAPTURE_PAUSE: String = "@capture"
+
+// X keysyms.
+const XK_SPACE: ffi::c_ulong = 0x0020
+const XK_TAB: ffi::c_ulong = 0xff09
+const XK_RETURN: ffi::c_ulong = 0xff0d
+const XK_ESCAPE: ffi::c_ulong = 0xff1b
+const XK_BACKSPACE: ffi::c_ulong = 0xff08
+const XK_DELETE: ffi::c_ulong = 0xffff
+const XK_INSERT: ffi::c_ulong = 0xff63
+const XK_HOME: ffi::c_ulong = 0xff50
+const XK_END: ffi::c_ulong = 0xff57
+const XK_PAGE_UP: ffi::c_ulong = 0xff55
+const XK_PAGE_DOWN: ffi::c_ulong = 0xff56
+const XK_PRINT: ffi::c_ulong = 0xff61
+const XK_PAUSE: ffi::c_ulong = 0xff13
+const XK_SCROLL_LOCK: ffi::c_ulong = 0xff14
+// F1 sits at 0xffbe and F1..F12 continue from there.
+const XK_F1: ffi::c_ulong = 0xffbe
+
+// Modifier lock bits. The grab carries Control, Alt, Shift, or Super plus
+// every combination of the lock modifiers, so it still answers with Num
+// Lock, Caps Lock, or a layout lock on.
+const SHIFT_MASK: ffi::c_uint = 1 << 0
+const LOCK_MASK: ffi::c_uint = 1 << 1
+const CONTROL_MASK: ffi::c_uint = 1 << 2
+const MOD1_MASK: ffi::c_uint = 1 << 3
+const MOD4_MASK: ffi::c_uint = 1 << 6
+const MOD2_MASK: ffi::c_uint = 1 << 4
+const MOD5_MASK: ffi::c_uint = 1 << 7
+
+const GRAB_MODE_ASYNC: ffi::c_int = 1
+const KEY_PRESS: ffi::c_int = 2
+const KEY_RELEASE: ffi::c_int = 3
+
+// The first member of the XEvent union, laid out as Xlib writes it: XKeyEvent
+// through its `state`/`keycode`, padded to the union's full 192 bytes so
+// XNextEvent cannot write past the struct.
+#[repr(C)]
+struct XEvent {
+    kind: ffi::c_int
+    serial: ffi::c_ulong
+    send_event: ffi::c_int
+    display: usize
+    window: ffi::c_ulong
+    root: ffi::c_ulong
+    subwindow: ffi::c_ulong
+    time: ffi::c_ulong
+    x: ffi::c_int
+    y: ffi::c_int
+    x_root: ffi::c_int
+    y_root: ffi::c_int
+    state: ffi::c_uint
+    keycode: ffi::c_uint
+    same_screen: ffi::c_int
+    pad: [ffi::c_ulong; 12]
+}
+
+unsafe extern "C" {
+    type Display
+    type XErrorEvent
+}
+
+#[link(name = "dl")]
+unsafe extern "C" {
+    type Library
+    fn dlopen(name: [u8], flags: ffi::c_int) -> Option<Ptr<Library>>
+    fn dlsym(handle: Ptr<Library>, name: [u8]) -> Option<Ptr<ffi::c_void>>
+}
+
+const RTLD_NOW: ffi::c_int = 2
+
+/// Xlib's entry points. libX11 is opened at run time, only for an X11
+/// session, so Feather starts on a Wayland system that has no X11 libraries.
+struct Xlib {
+    init_threads: Fn() -> ffi::c_int
+    detectable_auto_repeat: Fn(Ptr<Display>, ffi::c_int, Ptr<ffi::c_int>) -> ffi::c_int
+    peek_event: Fn(Ptr<Display>, Ptr<XEvent>) -> ffi::c_int
+    open_display: Fn(Option<Ptr<u8>>) -> Option<Ptr<Display>>
+    connection_number: Fn(Ptr<Display>) -> ffi::c_int
+    default_screen: Fn(Ptr<Display>) -> ffi::c_int
+    root_window: Fn(Ptr<Display>, ffi::c_int) -> ffi::c_ulong
+    keysym_to_keycode: Fn(Ptr<Display>, ffi::c_ulong) -> ffi::c_int
+    grab_key: Fn(Ptr<Display>, ffi::c_int, ffi::c_uint, ffi::c_ulong, ffi::c_int, ffi::c_int, ffi::c_int) -> ffi::c_int
+    ungrab_key: Fn(Ptr<Display>, ffi::c_int, ffi::c_uint, ffi::c_ulong) -> ffi::c_int
+    flush: Fn(Ptr<Display>) -> ffi::c_int
+    sync: Fn(Ptr<Display>, ffi::c_int) -> ffi::c_int
+    set_error_handler: Fn(usize) -> usize
+    pending: Fn(Ptr<Display>) -> ffi::c_int
+    next_event: Fn(Ptr<Display>, Ptr<XEvent>) -> ffi::c_int
+    close_display: Fn(Ptr<Display>) -> ffi::c_int
+}
+
+fn symbol(lib: Ptr<Library>, name: String) -> Option<Ptr<ffi::c_void>> {
+    unsafe { dlsym(lib, ffi::cstring(name).ok()?) }
+}
+
+/// libX11's functions, or None when the library is not installed.
+fn xlib() -> Option<Xlib> {
+    let lib = unsafe { dlopen(ffi::cstring("libX11.so.6").ok()?, RTLD_NOW) }?
+    // Each signature matches the Xlib prototype of the symbol it is read from.
+    unsafe {
+        Some(Xlib {
+            init_threads: ffi::fn_from_ptr::<Fn() -> ffi::c_int>(symbol(lib, "XInitThreads")?)
+            detectable_auto_repeat: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_int, Ptr<ffi::c_int>) -> ffi::c_int>(symbol(lib, "XkbSetDetectableAutoRepeat")?)
+            peek_event: ffi::fn_from_ptr::<Fn(Ptr<Display>, Ptr<XEvent>) -> ffi::c_int>(symbol(lib, "XPeekEvent")?)
+            open_display: ffi::fn_from_ptr::<Fn(Option<Ptr<u8>>) -> Option<Ptr<Display>>>(symbol(lib, "XOpenDisplay")?)
+            connection_number: ffi::fn_from_ptr::<Fn(Ptr<Display>) -> ffi::c_int>(symbol(lib, "XConnectionNumber")?)
+            default_screen: ffi::fn_from_ptr::<Fn(Ptr<Display>) -> ffi::c_int>(symbol(lib, "XDefaultScreen")?)
+            root_window: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_int) -> ffi::c_ulong>(symbol(lib, "XRootWindow")?)
+            keysym_to_keycode: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_ulong) -> ffi::c_int>(symbol(lib, "XKeysymToKeycode")?)
+            grab_key: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_int, ffi::c_uint, ffi::c_ulong, ffi::c_int, ffi::c_int, ffi::c_int) -> ffi::c_int>(symbol(lib, "XGrabKey")?)
+            ungrab_key: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_int, ffi::c_uint, ffi::c_ulong) -> ffi::c_int>(symbol(lib, "XUngrabKey")?)
+            flush: ffi::fn_from_ptr::<Fn(Ptr<Display>) -> ffi::c_int>(symbol(lib, "XFlush")?)
+            sync: ffi::fn_from_ptr::<Fn(Ptr<Display>, ffi::c_int) -> ffi::c_int>(symbol(lib, "XSync")?)
+            set_error_handler: ffi::fn_from_ptr::<Fn(usize) -> usize>(symbol(lib, "XSetErrorHandler")?)
+            pending: ffi::fn_from_ptr::<Fn(Ptr<Display>) -> ffi::c_int>(symbol(lib, "XPending")?)
+            next_event: ffi::fn_from_ptr::<Fn(Ptr<Display>, Ptr<XEvent>) -> ffi::c_int>(symbol(lib, "XNextEvent")?)
+            close_display: ffi::fn_from_ptr::<Fn(Ptr<Display>) -> ffi::c_int>(symbol(lib, "XCloseDisplay")?)
+        })
+    }
+}
+
+/// The watcher's own connection to the X server.
+struct X11 {
+    lib: Xlib
+    dpy: Ptr<Display>
+}
+
+impl X11 {
+    fn root(&self) -> ffi::c_ulong {
+        let screen = self.lib.default_screen
+        let root = self.lib.root_window
+        unsafe { root(self.dpy, screen(self.dpy)) }
+    }
+
+    fn sync(&self) -> () {
+        let sync = self.lib.sync
+        unsafe { sync(self.dpy, 0) }
+    }
+
+    fn flush(&self) -> () {
+        let flush = self.lib.flush
+        unsafe { flush(self.dpy) }
+    }
+
+    fn pending(&self) -> bool {
+        let pending = self.lib.pending
+        unsafe { pending(self.dpy) } > 0
+    }
+
+    // Xlib writes the event into C memory, read back as a copy.
+    fn take_event(&self, peek: bool) -> XEvent {
+        let slot: Ptr<XEvent> = unsafe { ffi::alloc(1) }
+        let read = if peek { self.lib.peek_event } else { self.lib.next_event }
+        unsafe { read(self.dpy, slot) }
+        let ev = unsafe { ffi::read(slot) }
+        unsafe { ffi::free(slot) }
+        ev
+    }
+}
+
+// Must precede the GUI's first Xlib call because the watcher and GUI use
+// Xlib on different threads. Without libX11 there is no X11 GUI to share it.
+pub fn init() -> Result<(), errors::Error> {
+    let Some(x) = xlib() else { return Ok(()) }
+    let init_threads = x.init_threads
+    if unsafe { init_threads() } == 0 { return Err(errors::new("Could not initialize Xlib threading")) }
+    Ok(())
+}
+
+// Xlib invokes this handler while processing replies. Only the watcher's
+// connection contributes errors to its synchronous grab check.
+static mut WATCH_DISPLAY: u64 = 0
+static mut GRAB_FAILED: bool = false
+static mut PREVIOUS_HANDLER: usize = 0
+
+fn handle_x_error(display: Ptr<Display>, error: Ptr<XErrorEvent>) -> ffi::c_int {
+    if display.address() == WATCH_DISPLAY {
+        GRAB_FAILED = true
+        return 0
+    }
+    if PREVIOUS_HANDLER != 0 {
+        let ptr = unsafe { Ptr::<ffi::c_void>::from_address(PREVIOUS_HANDLER as u64) }.unwrap()
+        let handler = unsafe { ffi::fn_from_ptr::<Fn(Ptr<Display>, Ptr<XErrorEvent>) -> ffi::c_int>(ptr) }
+        return handler(display, error)
+    }
+    0
+}
+
+// The X keysym a `Key` stands for, when it has a global form at all.
+pub fn keysym_of(key: Key) -> Option<ffi::c_ulong> {
+    match key {
+        Key::A => Some(0x61)
+        Key::B => Some(0x62)
+        Key::C => Some(0x63)
+        Key::D => Some(0x64)
+        Key::E => Some(0x65)
+        Key::F => Some(0x66)
+        Key::G => Some(0x67)
+        Key::H => Some(0x68)
+        Key::I => Some(0x69)
+        Key::J => Some(0x6a)
+        Key::K => Some(0x6b)
+        Key::L => Some(0x6c)
+        Key::M => Some(0x6d)
+        Key::N => Some(0x6e)
+        Key::O => Some(0x6f)
+        Key::P => Some(0x70)
+        Key::Q => Some(0x71)
+        Key::R => Some(0x72)
+        Key::S => Some(0x73)
+        Key::T => Some(0x74)
+        Key::U => Some(0x75)
+        Key::V => Some(0x76)
+        Key::W => Some(0x77)
+        Key::X => Some(0x78)
+        Key::Y => Some(0x79)
+        Key::Z => Some(0x7a)
+        Key::Num0 => Some(0x30)
+        Key::Num1 => Some(0x31)
+        Key::Num2 => Some(0x32)
+        Key::Num3 => Some(0x33)
+        Key::Num4 => Some(0x34)
+        Key::Num5 => Some(0x35)
+        Key::Num6 => Some(0x36)
+        Key::Num7 => Some(0x37)
+        Key::Num8 => Some(0x38)
+        Key::Num9 => Some(0x39)
+        Key::Space => Some(XK_SPACE)
+        Key::Tab => Some(XK_TAB)
+        Key::Return => Some(XK_RETURN)
+        Key::Escape => Some(XK_ESCAPE)
+        Key::Backspace => Some(XK_BACKSPACE)
+        Key::Delete => Some(XK_DELETE)
+        Key::Insert => Some(XK_INSERT)
+        Key::Home => Some(XK_HOME)
+        Key::End => Some(XK_END)
+        Key::PageUp => Some(XK_PAGE_UP)
+        Key::PageDown => Some(XK_PAGE_DOWN)
+        Key::PrintScreen => Some(XK_PRINT)
+        Key::Pause => Some(XK_PAUSE)
+        Key::ScrollLock => Some(XK_SCROLL_LOCK)
+        Key::F1 => Some(XK_F1)
+        Key::F2 => Some(XK_F1 + 1)
+        Key::F3 => Some(XK_F1 + 2)
+        Key::F4 => Some(XK_F1 + 3)
+        Key::F5 => Some(XK_F1 + 4)
+        Key::F6 => Some(XK_F1 + 5)
+        Key::F7 => Some(XK_F1 + 6)
+        Key::F8 => Some(XK_F1 + 7)
+        Key::F9 => Some(XK_F1 + 8)
+        Key::F10 => Some(XK_F1 + 9)
+        Key::F11 => Some(XK_F1 + 10)
+        Key::F12 => Some(XK_F1 + 11)
+        _ => None
+    }
+}
+
+// Keys that type nothing may go unmodified; a bare letter or digit would
+// swallow that key system-wide.
+fn unmodified_ok(key: Key) -> bool {
+    match key {
+        Key::F1 | Key::F2 | Key::F3 | Key::F4 | Key::F5 | Key::F6 | Key::F7 | Key::F8 | Key::F9 | Key::F10 | Key::F11 | Key::F12 | Key::PrintScreen | Key::Pause | Key::ScrollLock => true
+        _ => false
+    }
+}
+
+// The keysym and modifier bits of a binding in `Shortcut::parse` text form,
+// or None when the text is not one stroke, names no key, or names a key the
+// X server cannot watch globally (a chord, a media key, a bare letter).
+pub fn bindable(text: String) -> Option<(ffi::c_ulong, ffi::c_uint)> {
+    let sc = gui::Shortcut::parse(text)?
+    if sc.strokes.len() != 1 { return None }
+    let s = sc.strokes[0]
+    let keysym = keysym_of(s.key)?
+    let mut mods: ffi::c_uint = 0
+    if s.primary || s.ctrl { mods |= CONTROL_MASK as ffi::c_uint }
+    if s.alt { mods |= MOD1_MASK as ffi::c_uint }
+    if s.shift { mods |= SHIFT_MASK as ffi::c_uint }
+    if s.meta { mods |= MOD4_MASK as ffi::c_uint }
+    if mods == 0 && !unmodified_ok(s.key) { return None }
+    Some((keysym as ffi::c_ulong, mods))
+}
+
+// Whether `text` can serve as the global launch hotkey. The model runs this
+// before accepting a binding from Settings.
+pub fn can_grab(text: String) -> bool {
+    bindable(text).is_some()
+}
+
+// Cover every combination of Caps Lock, Num Lock, and the layout modifier.
+fn lock_combos() -> Vec<ffi::c_uint> {
+    #[0, LOCK_MASK, MOD2_MASK, MOD5_MASK, LOCK_MASK | MOD2_MASK
+        LOCK_MASK | MOD5_MASK, MOD2_MASK | MOD5_MASK, LOCK_MASK | MOD2_MASK | MOD5_MASK]
+}
+
+// Grabs `text` on the root window. Answers the keycode and base modifiers it
+// grabbed, or None when the key is unmapped or any combination is already
+// owned by another X client.
+fn grab_binding(x: X11, text: String) -> Option<(ffi::c_int, ffi::c_uint)> {
+    let keysym, mods = bindable(text)?
+    let mods = mods as ffi::c_uint
+    let to_keycode = x.lib.keysym_to_keycode
+    let keycode = unsafe { to_keycode(x.dpy, keysym) }
+    if keycode == 0 { return None }
+    let root = x.root()
+    let grab_key = x.lib.grab_key
+    GRAB_FAILED = false
+    for combo in lock_combos() {
+        unsafe { grab_key(x.dpy, keycode, mods | combo, root, 0, GRAB_MODE_ASYNC, GRAB_MODE_ASYNC) }
+    }
+    // XGrabKey reports protocol errors asynchronously. Round-trip before
+    // claiming success and undo partial grabs on any modifier combination.
+    x.sync()
+    if GRAB_FAILED {
+        ungrab_binding(x, keycode, mods)
+        x.sync()
+        return None
+    }
+    Some((keycode, mods))
+}
+
+fn ungrab_binding(x: X11, keycode: ffi::c_int, mods: ffi::c_uint) -> () {
+    let root = x.root()
+    let ungrab_key = x.lib.ungrab_key
+    for combo in lock_combos() {
+        unsafe { ungrab_key(x.dpy, keycode, mods | combo, root) }
+    }
+    x.flush()
+}
+
+// Moves the X11 grab to `want`, in `Shortcut::parse` text form. A failed
+// rebind restores the previous working grab. KDE releases only conflicting
+// assignments; unrelated keys on the same action survive.
+fn apply(x: X11, mailbox: gui::Mailbox, want: String, current: String, grabbed: Option<(ffi::c_int, ffi::c_uint)>) -> (String, Option<(ffi::c_int, ffi::c_uint)>) {
+    if want == current && (grabbed.is_some() || want == "") { return (current, grabbed) }
+    if want != "" {
+        if let Err(e) = desktop::override_binding(want) {
+            let previous = if grabbed.is_some() { grabbed } else { grab_binding(x, current) }
+            let restored = if previous.is_some() { current } else { "" }
+            mailbox.post(gui::UiMsg::Custom("hotkey.bound", restored))
+            mailbox.post(gui::UiMsg::Custom("hotkey.status", f"Could not override {want}: {e}"))
+            return (restored, previous)
+        }
+    }
+    if let Some((code, mods)) = grabbed { ungrab_binding(x, code, mods) }
+    let next = grab_binding(x, want)
+    if next.is_some() || want == "" {
+        let note = if want == "" { "The launch hotkey is off." } else { f"The launch hotkey is now {want}." }
+        mailbox.post(gui::UiMsg::Custom("hotkey.status", note))
+        return (want, next)
+    }
+    let previous = grab_binding(x, current)
+    let restored = if previous.is_some() { current } else { "" }
+    mailbox.post(gui::UiMsg::Custom("hotkey.bound", restored))
+    mailbox.post(gui::UiMsg::Custom("hotkey.status", f"Could not grab {want}. Another application may own it, or the X server has no keycode. The launch hotkey is {if restored == "" { "off" } else { restored }}."))
+    (restored, previous)
+}
+
+const NO_DISPLAY: String = "No X display is available. Open Feather from its application icon."
+
+fn status(mailbox: gui::Mailbox, note: String) -> () {
+    mailbox.post(gui::UiMsg::Custom("hotkey.status", note))
+}
+
+// Tells the model which binding the watcher now holds.
+fn bound(mailbox: gui::Mailbox, text: String) -> () {
+    mailbox.post(gui::UiMsg::Custom("hotkey.bound", text))
+}
+
+fn described(text: String) -> String {
+    if text == "" { "off" } else { text }
+}
+
+// With no shortcut service, every binding but "off" is reported as refused.
+fn unavailable(mailbox: gui::Mailbox, updates: Receiver<String>, rebind: wake::Wake, shutdown: wake::Wake, why: String) -> Result<(), errors::Error> {
+    bound(mailbox, "")
+    status(mailbox, why)
+    loop {
+        let ready = wake::wait(#[shutdown.fd, rebind.fd])?
+        if ready[0] { return Ok(()) }
+        rebind.clear()
+        while let Some(text) = updates.try_recv() {
+            if text != "" && text != CAPTURE_PAUSE {
+                bound(mailbox, "")
+                status(mailbox, why)
+            }
+        }
+    }
+}
+
+// A Wayland compositor shows global keys to no client: a root-window grab
+// through XWayland would only see keys aimed at other X11 windows.
+fn wayland() -> bool {
+    env::var("WAYLAND_DISPLAY").unwrap_or("") != "" || env::var("XDG_SESSION_TYPE").unwrap_or("") == "wayland"
+}
+
+/// Watches the launch hotkey on a dedicated thread until `shutdown` is
+/// signalled, posting "hotkey" with the press's activation token, or "".
+/// Each `rebind` signal means `updates` holds new bindings. An X11 session
+/// grabs the key on the root window; on Wayland the compositor lends it
+/// through KDE's shortcut service or the desktop portal's GlobalShortcuts.
+pub fn watch(mailbox: gui::Mailbox, updates: Receiver<String>, rebind: wake::Wake, shutdown: wake::Wake, initial: String) -> Result<(), errors::Error> {
+    if wayland() { return watch_bus(mailbox, updates, rebind, shutdown, initial) }
+    watch_x11(mailbox, updates, rebind, shutdown, initial)
+}
+
+fn watch_bus(mailbox: gui::Mailbox, updates: Receiver<String>, rebind: wake::Wake, shutdown: wake::Wake, initial: String) -> Result<(), errors::Error> {
+    let b = match bus::session() {
+        Ok(b) => b
+        Err(e) => return unavailable(mailbox, updates, rebind, shutdown, f"{e}. Open Feather from its application icon.")
+    }
+    let served = if desktop::is_kde() { serve_kde(b, mailbox, updates, rebind, shutdown, initial) } else { serve_portal(b, mailbox, updates, rebind, shutdown, initial) }
+    b.close()
+    match served {
+        Ok(()) => Ok(())
+        Err(e) => unavailable(mailbox, updates, rebind, shutdown, f"The desktop's shortcut service failed: {e}. Open Feather from its application icon.")
+    }
+}
+
+fn serve_kde(b: bus::Bus, mailbox: gui::Mailbox, updates: Receiver<String>, rebind: wake::Wake, shutdown: wake::Wake, initial: String) -> Result<(), errors::Error> {
+    let reg = desktop::register(b)?
+    let served = kde_loop(b, reg, mailbox, updates, rebind, shutdown, initial)
+    let released = desktop::unregister(b)
+    served?
+    released
+}
+
+// Answers the binding the watcher holds and whether KDE has its key.
+fn kde_apply(b: bus::Bus, mailbox: gui::Mailbox, want: String, current: String, active: bool) -> (String, bool) {
+    if want == current && (active || want == "") { return (current, active) }
+    match desktop::bind(b, want) {
+        Ok(()) => {
+            status(mailbox, if want == "" { "The launch hotkey is off." } else { f"The launch hotkey is now {want}." })
+            (want, want != "")
+        }
+        Err(e) => {
+            let restored = if current != "" && desktop::bind(b, current).is_ok() { current } else { "" }
+            bound(mailbox, restored)
+            status(mailbox, f"Could not bind {want}: {e}. The launch hotkey is {described(restored)}.")
+            (restored, restored != "")
+        }
+    }
+}
+
+// kglobalaccel reports each physical press once, so there is no repeat latch.
+fn kde_loop(b: bus::Bus, reg: desktop::Registration, mailbox: gui::Mailbox, updates: Receiver<String>, rebind: wake::Wake, shutdown: wake::Wake, initial: String) -> Result<(), errors::Error> {
+    let fd = b.fd()?
+    let mut current, mut active = kde_apply(b, mailbox, initial, "", false)
+    loop {
+        for s in b.signals()? {
+            match desktop::event(reg, s) {
+                desktop::Event::Pressed => mailbox.post(gui::UiMsg::Custom("hotkey", ""))
+                desktop::Event::Rebound(text) => {
+                    current = text
+                    active = text != ""
+                    bound(mailbox, text)
+                    status(mailbox, f"System Settings set the launch hotkey to {described(text)}.")
+                }
+                desktop::Event::Released | desktop::Event::Unrelated => ()
+            }
+        }
+        let ready = wake::wait(#[shutdown.fd, rebind.fd, fd])?
+        if ready[0] { return Ok(()) }
+        if !ready[1] { continue }
+        rebind.clear()
+        while let Some(want) = updates.try_recv() {
+            if want != CAPTURE_PAUSE {
+                current, active = kde_apply(b, mailbox, want, current, active)
+            } else if active {
+                match desktop::bind(b, "") {
+                    Ok(()) => active = false
+                    Err(e) => status(mailbox, f"Could not release {current} for recording: {e}")
+                }
+            }
+        }
+    }
+}
+
+fn serve_portal(b: bus::Bus, mailbox: gui::Mailbox, updates: Receiver<String>, rebind: wake::Wake, shutdown: wake::Wake, initial: String) -> Result<(), errors::Error> {
+    let mut p = portal::open(b, app::APP_ID)?
+    let served = portal_loop(b, &mut p, mailbox, updates, rebind, shutdown, initial)
+    let closed = p.close(b)
+    served?
+    closed
+}
+
+// The portal answers asynchronously (GNOME asks the user first), so success
+// is reported when the desktop's response arrives.
+fn portal_apply(b: bus::Bus, p: &mut portal::Portal, mailbox: gui::Mailbox, want: String, current: String) -> String {
+    if want == current && (p.active() || want == "") { return current }
+    match p.bind(b, want) {
+        Ok(()) => {
+            if want == "" { status(mailbox, "The launch hotkey is off.") }
+            want
+        }
+        Err(e) => {
+            bound(mailbox, "")
+            status(mailbox, f"Could not bind {want}: {e}. The launch hotkey is off.")
+            ""
+        }
+    }
+}
+
+fn portal_loop(b: bus::Bus, p: &mut portal::Portal, mailbox: gui::Mailbox, updates: Receiver<String>, rebind: wake::Wake, shutdown: wake::Wake, initial: String) -> Result<(), errors::Error> {
+    let fd = b.fd()?
+    let mut current = portal_apply(b, p, mailbox, initial, "")
+    // The last binding the desktop accepted, restored when a change fails.
+    let mut accepted = ""
+    loop {
+        for s in b.signals()? {
+            match p.event(s) {
+                portal::Event::Activated(token) => mailbox.post(gui::UiMsg::Custom("hotkey", token))
+                portal::Event::Created => {
+                    if let Err(e) = p.request_bind(b) {
+                        p.close(b)?
+                        bound(mailbox, "")
+                        status(mailbox, f"Could not bind {current}: {e}. The launch hotkey is off.")
+                        current = ""
+                    }
+                }
+                portal::Event::Bound(desc) => {
+                    accepted = current
+                    status(mailbox, if desc == "" { "The desktop has not given Feather a key yet. Choose one in the desktop's keyboard settings." } else { f"The launch hotkey is now {desc}." })
+                }
+                portal::Event::Failed(why) => {
+                    p.close(b)?
+                    let failed = current
+                    current = if accepted != "" && accepted != failed { portal_apply(b, p, mailbox, accepted, "") } else { "" }
+                    bound(mailbox, current)
+                    status(mailbox, f"Could not bind {failed}: {why}. The launch hotkey is {described(current)}.")
+                }
+                portal::Event::Changed(desc) => status(mailbox, f"The desktop set the launch hotkey to {if desc == "" { "nothing" } else { desc }}.")
+                portal::Event::Deactivated | portal::Event::Unrelated => ()
+            }
+        }
+        let ready = wake::wait(#[shutdown.fd, rebind.fd, fd])?
+        if ready[0] { return Ok(()) }
+        if !ready[1] { continue }
+        rebind.clear()
+        while let Some(want) = updates.try_recv() {
+            if want == CAPTURE_PAUSE { p.close(b)? } else { current = portal_apply(b, p, mailbox, want, current) }
+        }
+    }
+}
+
+fn watch_x11(mailbox: gui::Mailbox, updates: Receiver<String>, rebind: wake::Wake, shutdown: wake::Wake, initial: String) -> Result<(), errors::Error> {
+    let Some(lib) = xlib() else { return unavailable(mailbox, updates, rebind, shutdown, NO_DISPLAY) }
+    let open_display = lib.open_display
+    let Some(dpy) = unsafe { open_display(None) } else { return unavailable(mailbox, updates, rebind, shutdown, NO_DISPLAY) }
+    let x = X11 { lib: lib, dpy: dpy }
+    let set_error_handler = lib.set_error_handler
+    WATCH_DISPLAY = dpy.address()
+    PREVIOUS_HANDLER = unsafe { set_error_handler(ffi::fn_addr(handle_x_error).address() as usize) }
+    let mut grabbed: Option<(ffi::c_int, ffi::c_uint)> = None
+    let result = serve(x, mailbox, updates, rebind, shutdown, initial, &mut grabbed)
+    if let Some((keycode, mods)) = grabbed { ungrab_binding(x, keycode, mods) }
+    x.sync()
+    let close_display = lib.close_display
+    unsafe {
+        set_error_handler(PREVIOUS_HANDLER)
+        close_display(dpy)
+    }
+    WATCH_DISPLAY = 0
+    result
+}
+
+// `grabbed` stays current on every exit so the caller can release the grab.
+fn serve(x: X11, mailbox: gui::Mailbox, updates: Receiver<String>, rebind: wake::Wake, shutdown: wake::Wake, initial: String, grabbed: &mut Option<(ffi::c_int, ffi::c_uint)>) -> Result<(), errors::Error> {
+    let supported: Ptr<ffi::c_int> = unsafe { ffi::alloc(1) }
+    let detectable = x.lib.detectable_auto_repeat
+    unsafe { detectable(x.dpy, 1, supported) }
+    let repeat_supported = unsafe { ffi::read(supported) }
+    unsafe { ffi::free(supported) }
+    let connection_number = x.lib.connection_number
+    let connection = unsafe { connection_number(x.dpy) }
+    let mut pressed = false
+    let mut current = ""
+    current, *grabbed = apply(x, mailbox, initial, current, *grabbed)
+    loop {
+        // Replies read during a grab or sync can leave events queued inside
+        // Xlib, where poll(2) cannot see them, so drain the queue first.
+        while x.pending() {
+            let ev = x.take_event(false)
+            let Some((code, mods)) = *grabbed else { continue }
+            if ev.keycode != code as ffi::c_uint { continue }
+            if ev.kind == KEY_RELEASE {
+                // Older servers encode auto-repeat as release/press pairs
+                // with identical timestamps. Keep the latch set.
+                if repeat_supported == 0 && x.pending() {
+                    let next = x.take_event(true)
+                    if next.kind == KEY_PRESS && next.keycode == ev.keycode && next.time == ev.time { continue }
+                }
+                pressed = false
+            } else if ev.kind == KEY_PRESS && !pressed && (ev.state & !(LOCK_MASK | MOD2_MASK | MOD5_MASK)) == mods {
+                pressed = true
+                mailbox.post(gui::UiMsg::Custom("hotkey", ""))
+            }
+        }
+        let ready = wake::wait(#[shutdown.fd, rebind.fd, connection])?
+        if ready[0] { return Ok(()) }
+        if !ready[1] { continue }
+        rebind.clear()
+        while let Some(want) = updates.try_recv() {
+            if want == CAPTURE_PAUSE {
+                if let Some((code, mods)) = *grabbed { ungrab_binding(x, code, mods) }
+                *grabbed = None
+            } else {
+                current, *grabbed = apply(x, mailbox, want, current, *grabbed)
+            }
+            pressed = false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn lock_masks_are_x11_modifier_bits() {
+        assert_eq(super::MOD2_MASK, 16)
+        assert_eq(super::MOD5_MASK, 128)
+        let combos = super::lock_combos()
+        assert_eq(combos.len(), 8)
+        for mask in combos { assert(mask < 256) }
+    }
+}

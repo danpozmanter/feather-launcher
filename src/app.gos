@@ -1,0 +1,661 @@
+// Application state, messages, views, and commands. Native window lifecycle
+// belongs to windows.gos and main.gos.
+use std::{fs, runtime}
+use gui
+use gui::{Effect, UiMsg, Widget}
+use gui::dialogs::request
+use gui::services::apps::AppEntry
+use gui::widgets::completion::{Completion, CompletionItem}
+use gui::widgets::cx::TaskOutcome
+use gui::widgets::display
+use gui::text::layout::TextAlign
+use gui::widgets::textinput::{InputKind, TextInput}
+use hotkey
+use search
+
+pub const APP_ID: String = "dev.gossamer.feather-launcher"
+/// Feather's icon, embedded so a build run from anywhere shows it.
+pub const ICON_SVG: String = comptime { fs::read_to_string("assets/feather-launcher.svg").unwrap() }
+/// Feather's accent: the selected result, buttons, and focused fields.
+pub const BRONZE: gui::Color = gui::Color::hex(0xB05E24)
+const FOCUS: gui::Color = gui::Color::hex(0x5C3112)
+pub const APP_VERSION: String = "0.1.0"
+
+// Default global launch shortcut and window-local quit shortcut.
+pub const DEFAULT_LAUNCH_KEY: String = "Ctrl+Space"
+const DEFAULT_QUIT_KEY: String = "Ctrl+Shift+Q"
+
+// The Settings window's size in interface units: everything fits without
+// wrapping a description or scrolling. It is also the smallest the window gets,
+// so a smaller remembered size cannot crowd the content.
+const SETTINGS_WIDTH: i64 = 900
+const SETTINGS_HEIGHT: i64 = 640
+
+// Proposals the list holds; it shows eight and scrolls.
+const PROPOSALS: i64 = 50
+
+pub struct Model {
+    apps: Vec<AppEntry>
+    loading: bool
+    query: String
+    /// A completion request that arrived before the catalog: (id, query).
+    waiting: Option<(i64, String)>
+    /// Text submitted before the catalog arrived, launched once it does.
+    submitted: Option<String>
+    /// Why the last Enter started nothing, shown under the field until the
+    /// text changes.
+    error: String
+    fixture: bool
+    launches: Vec<String>
+    /// Whether the run box is meant to be on screen. The driver loop raises
+    /// or hides the native window whenever this flips.
+    pub shown: bool
+    /// The driver exits after this update.
+    pub quit: bool
+    /// The global launch hotkey and the extra quit shortcut, in
+    /// `Shortcut::parse` text form. "" switches a shortcut off.
+    pub launch_key: String
+    /// Temporarily release the global grab while a shortcut is recorded.
+    pub capturing_shortcut: bool
+    quit_key: String
+    /// What the last shortcut change did, shown in the Settings window.
+    settings_note: String
+    /// Feather's icon, drawn once for the Settings header.
+    logo: Option<gui::AppIcon>
+}
+
+fn fixture_entry(id: String, name: String, program: String) -> AppEntry {
+    let glyph = if id == "terminal" { gui::Icon::Terminal } else if id == "editor" { gui::Icon::FileText } else { gui::Icon::Grid }
+    let image = gui::AppIcon::drawn(glyph, 32, BRONZE, gui::Color::white())
+    AppEntry { id: id, name: name, generic_name: String::new(), comment: String::new(), icon: String::new(), keywords: #[], categories: #[], exec: #[program], terminal: false, source: String::new(), image: Some(image) }
+}
+
+fn fixture_catalog() -> Vec<AppEntry> {
+    let mut editor = fixture_entry("editor", "Text Editor", "gedit")
+    editor.keywords = #["notes"]
+    editor.generic_name = "Editor"
+    let mut calculator = fixture_entry("calculator", "Calculator", "gnome-calculator")
+    calculator.generic_name = "Calculator"
+    #[calculator, editor, fixture_entry("terminal", "Terminal", "x-terminal-emulator")]
+}
+
+pub fn init(fixture: bool) -> Model {
+    Model {
+        apps: if fixture { fixture_catalog() } else { #[] }
+        loading: !fixture
+        query: "", waiting: None, submitted: None, error: "", fixture: fixture, launches: #[]
+        // The run box opens when the program starts; the hotkey or a launch
+        // hides it and the hotkey raises it again.
+        shown: true
+        quit: false
+        launch_key: DEFAULT_LAUNCH_KEY
+        capturing_shortcut: false
+        quit_key: DEFAULT_QUIT_KEY
+        settings_note: ""
+        logo: gui::AppIcon::from_svg(ICON_SVG, 104).ok()
+    }
+}
+
+// The proposals for `query`, best first. Recents are not remembered: every
+// search starts from a clean history, so the same text always orders alike.
+fn proposals(m: Model, query: String) -> Vec<CompletionItem> {
+    let found = search::find(m.apps, query, PROPOSALS)
+    let n = found.len()
+    let mut out = #[]
+    for (i, e) in found.iter().enumerate() {
+        let mut item = CompletionItem::new(e.id, e.name).with_detail(e.generic_name)
+        item.image = e.image
+        item.icon = Some(gui::Icon::Grid)
+        // The list sorts by score; descending scores keep the search's order.
+        item.score = (n - i) as f64
+        item.matches = search::highlights(e.name, query)
+        out.push(item)
+    }
+    out
+}
+
+fn launch(m: Model, id: String) -> Model {
+    let chosen = m.apps.filter(|e| e.id == id)
+    if chosen.is_empty() { return m }
+    let e = chosen[0]
+    let mut n = m
+    if n.fixture {
+        n.launches.push(e.id)
+        n = hide(n)
+    } else {
+        gui::perform(Effect::LaunchApp("launch", e, #[]))
+    }
+    n
+}
+
+// Enter without a highlighted proposal starts the best match.
+fn submit(m: Model, text: String) -> Model {
+    if m.loading {
+        let mut n = m
+        n.submitted = Some(text)
+        return n
+    }
+    let best = search::find(m.apps, text, 1)
+    if best.is_empty() {
+        let mut n = m
+        n.error = if text.trim().is_empty() { "" } else { f"No application matches \u{201c}{text.trim()}\u{201d}" }
+        return n
+    }
+    launch(m, best[0].id)
+}
+
+fn show(mut m: Model) -> Model {
+    if !m.shown { m.query = ""; m.error = "" }
+    m.shown = true
+    m
+}
+
+fn hide(mut m: Model) -> Model {
+    m.shown = false
+    m.submitted = None
+    m.waiting = None
+    m
+}
+
+fn quit(mut m: Model) -> Model {
+    m = hide(m)
+    m.quit = true
+    m
+}
+
+pub fn update(m: Model, msg: UiMsg) -> Model {
+    let mut n = m
+    if let UiMsg::Dialog(id, _) = msg {
+        if id == "shortcut.launch" || id == "shortcut.quit" { n.capturing_shortcut = false }
+    }
+    match msg {
+        UiMsg::Custom(id, _) if id == "hotkey" => n = if n.shown { hide(n) } else { show(n) }
+        UiMsg::Custom(id, _) if id == "activate" => n = show(n)
+        UiMsg::Custom(id, text) if id == "hotkey.status" => if !n.capturing_shortcut { n.settings_note = text }
+        UiMsg::Custom(id, text) if id == "hotkey.bound" => n.launch_key = text
+        UiMsg::CloseRequested(id) => if id == "main" { n = hide(n) }
+        else if id == "settings" { gui::perform(Effect::CloseWindow("settings")) }
+        UiMsg::QuitRequested => n = quit(n)
+        UiMsg::AppsLoaded(_, found) => {
+            n.apps = found
+            n.loading = false
+            if let Some((request, query)) = n.waiting {
+                gui::perform(Effect::Complete("run", request, proposals(n, query), ""))
+                n.waiting = None
+            }
+            if let Some(text) = n.submitted {
+                n.submitted = None
+                n = submit(n, text)
+            }
+        }
+        UiMsg::CompletionRequest(id, request, query, _) => if id == "run" {
+            if n.loading { n.waiting = Some((request, query)) }
+            else { gui::perform(Effect::Complete("run", request, proposals(n, query), "")) }
+        }
+        UiMsg::Text(id, text) => if id == "run" {
+            n.query = text
+            n.error = ""
+            n.submitted = None
+        }
+        UiMsg::Select(id, key) => if id == "run" { n = launch(n, key) }
+        UiMsg::Submit(id, text) => if id == "run" { n = submit(n, text) }
+        UiMsg::Command(id) => n = command(n, id)
+        UiMsg::WindowCommand(_, id) => n = command(n, id)
+        UiMsg::Click(id) => n = click(n, id)
+        UiMsg::Dialog(id, gui::Outcome::Shortcut(text)) => n = shortcut_changed(n, id, text)
+        UiMsg::Task(id, outcome) => if id == "launch" {
+            match outcome {
+                TaskOutcome::Done(_) => n = hide(n)
+                TaskOutcome::Failed(why) => n.error = f"Could not start it: {why}"
+                TaskOutcome::Cancelled => ()
+            }
+        }
+        _ => ()
+    }
+    n
+}
+
+fn command(m: Model, id: String) -> Model {
+    if id == "gui.quit" { return quit(m) }
+    if id == "app.close-settings" { gui::perform(Effect::CloseWindow("settings")) }
+    m
+}
+
+fn click(mut m: Model, id: String) -> Model {
+    if id == "settings.launch" || id == "settings.quit" { m.capturing_shortcut = true }
+    match id {
+        "app.settings" => open_settings()
+        "settings.close" => gui::perform(Effect::CloseWindow("settings"))
+        "settings.about" => gui::perform(Effect::OpenDialogIn("settings", about()))
+        "settings.quit-app" => { return quit(m) }
+        "settings.launch" => gui::perform(Effect::OpenDialogIn("settings", gui::DialogRequest::Shortcut {
+            id: "shortcut.launch", title: "Launch shortcut", initial: m.launch_key, reserved: launch_reserved(m)
+        }))
+        "settings.quit" => gui::perform(Effect::OpenDialogIn("settings", gui::DialogRequest::Shortcut {
+            id: "shortcut.quit", title: "Quit shortcut", initial: m.quit_key, reserved: quit_reserved(m)
+        }))
+        _ => ()
+    }
+    m
+}
+
+fn shortcut_changed(mut m: Model, id: String, text: String) -> Model {
+    if id == "shortcut.launch" {
+        if text == "" {
+            m.launch_key = ""
+            m.settings_note = "The launch hotkey is off. Open Feather from its icon or another launcher."
+        } else if !hotkey::can_grab(text) {
+            let now = if m.launch_key == "" { "off" } else { m.launch_key }
+            m.settings_note = f"Feather cannot watch {text} globally; the launch hotkey stays {now}."
+        } else {
+            m.launch_key = text
+            m.settings_note = f"Applying the launch hotkey {text}…"
+        }
+    } else if id == "shortcut.quit" {
+        m.quit_key = text
+        m.settings_note = if text == "" { "The quit shortcut is off. Use Quit Feather in Settings." }
+        else { f"The quit shortcut is now {text}." }
+    }
+    m
+}
+
+// What the launch shortcut must not take: Ctrl+Esc always quits, and so does
+// the quit shortcut when one is set.
+fn launch_reserved(m: Model) -> Vec<String> {
+    let mut r = #["Ctrl+Esc"]
+    if m.quit_key != "" && m.quit_key != "Ctrl+Esc" { r.push(m.quit_key) }
+    r
+}
+
+// What the quit shortcut must not take: the global launch hotkey, when one
+// is set.
+fn quit_reserved(m: Model) -> Vec<String> {
+    if m.launch_key == "" { #[] } else { #[m.launch_key] }
+}
+
+// Feather's version, then the Gossamer release running it and the gui-gos
+// toolkit it was built with, one per line.
+fn about() -> gui::DialogRequest {
+    request::about("about", "Feather", APP_VERSION, f"Gossamer {runtime::version()}\ngui-gos {gui::VERSION}")
+}
+
+fn open_settings() {
+    gui::perform(Effect::OpenWindow { key: "settings", title: "Feather Settings", width: SETTINGS_WIDTH, height: SETTINGS_HEIGHT })
+    gui::perform(Effect::SetMinSize("settings", SETTINGS_WIDTH, SETTINGS_HEIGHT))
+    gui::perform(Effect::FocusIn("settings", "settings.close"))
+}
+
+pub fn view(m: Model, window: String) -> Widget {
+    if window == "settings" { return styled(settings_view(m)) }
+    // Extra native height belongs to suggestions, not the centered entry row.
+    styled(Widget::row(#[
+        Widget::tool_button("app.settings", gui::Icon::Settings, "Settings")
+        Widget::input(run_input(m)).grow(1)
+    ], 8).padding(8).bordered().align(0.0, 0.0))
+}
+
+fn styled(widget: Widget) -> Widget {
+    widget.themed(gui::ThemeOverride {
+        kind: None, density: None, rtl: None, text_scale: 0.0, tokens: None
+        focus: Some(FOCUS), accent: Some(BRONZE)
+    })
+}
+
+fn run_input(m: Model) -> TextInput {
+    let mut c = Completion::asynchronous(0)
+    c.limit = PROPOSALS
+    let mut field = TextInput::new("run", m.query, "Start typing...", InputKind::Line)
+    field.completion = Some(c)
+    field.error = m.error
+    field.leading_icon = Some(gui::Icon::Search)
+    if !m.query.trim().is_empty() {
+        let best = search::find(m.apps, m.query, 1)
+        if !best.is_empty() {
+            field.leading_image = best[0].image
+            field.leading_icon = Some(gui::Icon::Grid)
+        }
+    }
+    field
+}
+
+// Settings and the result of the latest shortcut change. The footer stays
+// pinned while the body scrolls, so a short window never overlaps the two.
+// Focus runs from the launch shortcut's Change… button to Close, the last stop.
+fn settings_view(m: Model) -> Widget {
+    let note = if m.settings_note == "" { "Press Change…, then hold the new combination. Clear it to switch the shortcut off." } else { m.settings_note }
+    let header = Widget::flex(gui::Axis::Horizontal, #[
+        match m.logo {
+            Some(icon) => Widget::image(icon.rgba, icon.width, icon.height, "").width(52).height(52)
+            None => Widget::Icon(display::Icon { icon: gui::Icon::Search, units: 28, tone: gui::Tone::OnAccent, label: String::new() })
+                .padding(12).background(gui::Tone::Accent).radius(12)
+        }
+        Widget::column(#[
+            Widget::title("Feather")
+            caption(f"Version {APP_VERSION} \u{00b7} Start any application by name")
+        ], 2).grow(1)
+    ], 16, gui::MainAlign::Start, gui::CrossAlign::Center)
+    let shortcuts = Widget::card(Widget::column(#[
+        shortcut_row("settings.launch", "Open Feather", "Shows or hides the run box.", m.launch_key)
+        Widget::separator()
+        shortcut_row("settings.quit", "Quit Feather", "Ends Feather completely.", m.quit_key)
+    ], 16))
+    let status = Widget::flex(gui::Axis::Horizontal, #[
+        Widget::icon(gui::Icon::Info, 18)
+        caption(note).grow(1)
+    ], 10, gui::MainAlign::Start, gui::CrossAlign::Start).padding_xy(4, 0)
+    let body = Widget::column(#[
+        header
+        Widget::spacer(8)
+        Widget::text("Keyboard shortcuts", gui::TextRole::Label, gui::Tone::Normal)
+        shortcuts
+        status
+    ], 12).padding_sides(28, 24, 28, 16)
+    let actions = Widget::flex(gui::Axis::Horizontal, #[
+        Widget::button("settings.about", "About")
+        Widget::danger_button("settings.quit-app", "Quit Feather")
+        Widget::stretch()
+        Widget::primary_button("settings.close", "Close").min_width(110)
+    ], 10, gui::MainAlign::Start, gui::CrossAlign::Center).padding_xy(28, 16)
+    Widget::column(#[
+        Widget::scroll("settings.body", body).grow(1)
+        Widget::separator()
+        actions
+    ], 0).background(gui::Tone::Background).key("settings")
+}
+
+// Secondary text that wraps to the width it is given.
+fn caption(text: String) -> Widget {
+    let mut l = display::Label::new(text, gui::TextRole::Small)
+    l.tone = gui::Tone::Muted
+    l.wrap = true
+    Widget::Text(l)
+}
+
+// A key combination drawn as a keycap; an empty binding reads "Off". Keycaps
+// share a minimum width so ordinary shortcut rows line up.
+fn keycap(key: String) -> Widget {
+    let text = if key == "" { "Off" } else { key }
+    let tone = if key == "" { gui::Tone::Muted } else { gui::Tone::Normal }
+    let mut l = display::Label::new(text, gui::TextRole::Mono)
+    l.tone = tone
+    l.align = TextAlign::Center
+    Widget::Text(l).min_width(200).padding_xy(10, 4).background(gui::Tone::Field).bordered().radius(6)
+}
+
+// One shortcut: what it does on the left, its binding and Change… on the right.
+fn shortcut_row(id: String, name: String, description: String, key: String) -> Widget {
+    Widget::flex(gui::Axis::Horizontal, #[
+        Widget::column(#[
+            Widget::text(name, gui::TextRole::Label, gui::Tone::Normal)
+            caption(description)
+        ], 4).grow(1)
+        keycap(key)
+        Widget::button(id, "Change…").min_width(120)
+    ], 16, gui::MainAlign::Start, gui::CrossAlign::Center)
+}
+
+pub fn commands(m: Model) -> Vec<gui::Command> {
+    let mut quit = gui::Command::new("gui.quit", "Quit Feather").key("Ctrl+Esc")
+    if m.quit_key != "" && m.quit_key != "Ctrl+Esc" { quit = quit.key(m.quit_key) }
+    #[quit, gui::Command::new("app.close-settings", "Close Settings").key("Esc").in_scope("settings")]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs
+    use gui::UiMsg
+
+    fn fixture() -> super::Model { super::init(true) }
+
+    #[test]
+    fn the_box_opens_at_start_and_the_hotkey_toggles_it_with_a_fresh_query() {
+        let m = fixture()
+        assert(m.shown)
+        let mut m = super::update(m, UiMsg::Custom("hotkey", ""))
+        assert(!m.shown)
+        m = super::update(m, UiMsg::Custom("hotkey", ""))
+        assert(m.shown)
+        m.query = "left over"
+        m.error = "left over"
+        let m = super::update(m, UiMsg::Custom("hotkey", ""))
+        assert(!m.shown)
+        let m = super::update(m, UiMsg::Custom("hotkey", ""))
+        assert(m.shown)
+        assert_eq(m.query, "")
+        assert_eq(m.error, "")
+    }
+
+    #[test]
+    fn a_close_request_hides_instead_of_quitting() {
+        let m = fixture()
+        assert(m.shown)
+        let m = super::update(m, UiMsg::CloseRequested("main"))
+        assert(!m.shown)
+    }
+
+    #[test]
+    fn activation_shows_instead_of_toggling_and_settings_close_keeps_main_visible() {
+        let mut m = fixture()
+        m.query = "keep while visible"
+        m = super::update(m, UiMsg::Custom("activate", ""))
+        assert(m.shown)
+        assert_eq(m.query, "keep while visible")
+        m = super::update(m, UiMsg::CloseRequested("settings"))
+        assert(m.shown)
+        m = super::update(m, UiMsg::CloseRequested("main"))
+        m = super::update(m, UiMsg::Custom("activate", ""))
+        assert(m.shown)
+        assert_eq(m.query, "")
+    }
+
+    #[test]
+    fn failed_hotkey_changes_restore_the_last_working_binding() {
+        let mut m = fixture()
+        m = super::update(m, UiMsg::Dialog("shortcut.launch", super::gui::Outcome::Shortcut("Ctrl+Alt+L")))
+        m = super::update(m, UiMsg::Custom("hotkey.bound", "Ctrl+Space"))
+        m = super::update(m, UiMsg::Custom("hotkey.status", "Could not grab Ctrl+Alt+L"))
+        assert_eq(m.launch_key, "Ctrl+Space")
+        assert_eq(m.settings_note, "Could not grab Ctrl+Alt+L")
+    }
+
+    #[test]
+    fn hiding_or_editing_cancels_a_submission_waiting_for_the_catalog() {
+        let mut m = fixture()
+        m.loading = true
+        m = super::update(m, UiMsg::Submit("run", "term"))
+        assert_eq(m.submitted, Some("term"))
+        m = super::update(m, UiMsg::Custom("hotkey", ""))
+        m = super::update(m, UiMsg::AppsLoaded("catalog", super::fixture_catalog()))
+        assert(m.launches.is_empty())
+        m.loading = true
+        m = super::update(m, UiMsg::Submit("run", "term"))
+        m = super::update(m, UiMsg::Text("run", "edit"))
+        m = super::update(m, UiMsg::AppsLoaded("catalog", super::fixture_catalog()))
+        assert(m.launches.is_empty())
+    }
+
+    #[test]
+    fn a_fixture_launch_hides_and_enter_starts_the_best_match() {
+        let m = fixture()
+        let m = super::update(m, UiMsg::Submit("run", "edit"))
+        assert_eq(m.launches, #["editor"])
+        assert(!m.shown)
+    }
+
+    #[test]
+    fn a_real_launch_hides_only_when_it_succeeded() {
+        let mut m = fixture()
+        m.fixture = false
+        // The launch is on its way; the box stays until the answer.
+        m = super::update(m, UiMsg::Submit("run", "term"))
+        assert(m.shown)
+        m = super::update(m, UiMsg::Task("launch", super::TaskOutcome::Done("")))
+        assert(!m.shown)
+        // A failure keeps the box up to show why.
+        m = super::update(m, UiMsg::Custom("hotkey", ""))
+        m = super::update(m, UiMsg::Submit("run", "term"))
+        m = super::update(m, UiMsg::Task("launch", super::TaskOutcome::Failed("no such file")))
+        assert(m.shown)
+        assert_eq(m.error, "Could not start it: no such file")
+    }
+
+    #[test]
+    fn application_icons_reach_results_and_the_entry_with_missing_icon_fallbacks() {
+        let mut m = fixture()
+        let items = super::proposals(m, "term")
+        assert_eq(items[0].image, m.apps[2].image)
+        assert(items[0].image.is_some())
+        m = super::update(m, UiMsg::Text("run", "term"))
+        assert_eq(super::run_input(m).leading_image, items[0].image)
+        m.apps[2].image = None
+        assert(super::run_input(m).leading_image.is_none())
+        assert_eq(super::proposals(m, "term")[0].icon, Some(super::gui::Icon::Grid))
+        m = super::update(m, UiMsg::Text("run", ""))
+        assert_eq(super::run_input(m).leading_icon, Some(super::gui::Icon::Search))
+        assert(super::run_input(m).leading_image.is_none())
+    }
+
+    #[test]
+    fn proposals_ignore_case_and_match_keywords() {
+        let m = fixture()
+        assert_eq(super::proposals(m, "cALC").map(|i| i.key), #["calculator"])
+        assert_eq(super::proposals(m, "Notes").map(|i| i.key), #["editor"])
+        // Names starting with the text, then a word starting with it, then containing it.
+        assert_eq(super::proposals(m, "t").map(|i| i.key), #["terminal", "editor", "calculator"])
+        // A launch is not remembered: the order a fresh search gives stays put.
+        let m = super::update(m, UiMsg::Select("run", "editor"))
+        assert_eq(super::proposals(m, "t").map(|i| i.key), #["terminal", "editor", "calculator"])
+    }
+
+    #[test]
+    fn fuzzy_search_preserves_order_and_ignores_hidden_substrings() {
+        let mut m = fixture()
+        let mut mail = super::fixture_entry("mail", "Mail", "mail")
+        mail.generic_name = "Mail Client"
+        mail.comment = "Mail client for Linux"
+        mail.keywords = #["Linux", "Email"]
+        m.apps.push(mail)
+        m.apps.push(super::fixture_entry("libre", "LibreOffice", "libreoffice"))
+        assert_eq(super::proposals(m, "li").map(|item| item.key), #["libre"])
+        assert(super::proposals(m, "ml").iter().any(|item| item.key == "mail"))
+        assert(super::proposals(m, "lll").is_empty())
+        let launched = super::update(m, UiMsg::Submit("run", "li"))
+        assert_eq(launched.launches, #["libre"])
+        let no_match = super::update(m, UiMsg::Submit("run", "zzqq"))
+        assert(no_match.launches.is_empty())
+        let input = super::run_input(super::update(m, UiMsg::Text("run", "li")))
+        assert_eq(input.leading_image, m.apps[4].image)
+    }
+
+    #[test]
+    fn enter_on_text_nothing_matches_explains_until_the_text_changes() {
+        let mut m = fixture()
+        m = super::update(m, UiMsg::Submit("run", "zzz"))
+        assert(m.launches.is_empty())
+        assert_eq(m.error, "No application matches \u{201c}zzz\u{201d}")
+        m = super::update(m, UiMsg::Text("run", "zz"))
+        assert_eq(m.error, "")
+    }
+
+    #[test]
+    fn a_quit_request_while_shown_ends_the_program() {
+        let mut m = fixture()
+        m = super::update(m, UiMsg::Custom("hotkey", ""))
+        assert(!m.quit)
+        m = super::update(m, UiMsg::QuitRequested)
+        assert(m.quit)
+        assert(!m.shown)
+    }
+
+    #[test]
+    fn the_settings_button_opens_settings_and_quit_button_ends_the_app() {
+        let mut m = fixture()
+        assert(m.shown)
+        m = super::update(m, UiMsg::Click("app.settings"))
+        m = super::update(m, UiMsg::Click("settings.about"))
+        assert(!m.quit)
+        assert(m.shown)
+        let m = super::update(m, UiMsg::Click("settings.quit-app"))
+        assert(m.quit)
+        assert(!m.shown)
+    }
+
+    #[test]
+    fn the_app_version_matches_the_project_manifest() {
+        let manifest = fs::read_to_string("project.toml").unwrap()
+        let line = f"version = \"{super::APP_VERSION}\""
+        assert(manifest.lines().any(|l| l.trim() == line), f"project.toml does not declare {line}")
+    }
+
+    #[test]
+    fn about_lists_the_feather_gossamer_and_gui_gos_versions() {
+        let super::gui::DialogRequest::About { version, description, .. } = super::about() else {
+            panic("about() answers an About request")
+        }
+        assert_eq(version, super::APP_VERSION)
+        assert_eq(description, f"Gossamer {super::runtime::version()}\ngui-gos {super::gui::VERSION}")
+        assert(!super::runtime::version().is_empty())
+    }
+
+    #[test]
+    fn shortcut_recording_suspends_the_grab_and_cancel_preserves_the_binding() {
+        let mut m = fixture()
+        m = super::update(m, UiMsg::Click("settings.launch"))
+        assert(m.capturing_shortcut)
+        assert_eq(m.launch_key, "Ctrl+Space")
+        m = super::update(m, UiMsg::Dialog("shortcut.launch", super::gui::Outcome::Cancelled))
+        assert(!m.capturing_shortcut)
+        assert_eq(m.launch_key, "Ctrl+Space")
+        m = super::update(m, UiMsg::Click("settings.launch"))
+        m = super::update(m, UiMsg::Dialog("shortcut.launch", super::gui::Outcome::Shortcut("Ctrl+Home")))
+        assert(!m.capturing_shortcut)
+        assert_eq(m.launch_key, "Ctrl+Home")
+    }
+
+    #[test]
+    fn a_captured_shortcut_rebinds_launch_and_quit() {
+        let mut m = fixture()
+        m = super::update(m, UiMsg::Dialog("shortcut.launch", super::gui::Outcome::Shortcut("Ctrl+Alt+L")))
+        assert_eq(m.launch_key, "Ctrl+Alt+L")
+        assert(m.settings_note != "")
+        // A key with no global form is refused; the old binding stays.
+        m = super::update(m, UiMsg::Dialog("shortcut.launch", super::gui::Outcome::Shortcut("Ctrl+Help")))
+        assert_eq(m.launch_key, "Ctrl+Alt+L")
+        // Clearing switches the hotkey off.
+        m = super::update(m, UiMsg::Dialog("shortcut.launch", super::gui::Outcome::Shortcut("")))
+        assert_eq(m.launch_key, "")
+        // Quit rebinds the same way.
+        m = super::update(m, UiMsg::Dialog("shortcut.quit", super::gui::Outcome::Shortcut("Ctrl+Alt+Q")))
+        assert_eq(m.quit_key, "Ctrl+Alt+Q")
+        // Cancelled: nothing changes.
+        m = super::update(m, UiMsg::Dialog("shortcut.launch", super::gui::Outcome::Cancelled))
+        assert_eq(m.launch_key, "")
+        assert_eq(m.quit_key, "Ctrl+Alt+Q")
+    }
+
+    #[test]
+    fn the_two_shortcuts_reserve_each_other_and_ctrl_esc_reserves_itself() {
+        let mut m = fixture()
+        // The launch hotkey must not take what quits.
+        assert_eq(super::launch_reserved(m), #["Ctrl+Esc", "Ctrl+Shift+Q"])
+        m = super::update(m, UiMsg::Dialog("shortcut.launch", super::gui::Outcome::Shortcut("Ctrl+Alt+L")))
+        // The quit shortcut must not take what launches.
+        assert_eq(super::quit_reserved(m), #["Ctrl+Alt+L"])
+        // With the launch hotkey off, quit may take anything.
+        m = super::update(m, UiMsg::Dialog("shortcut.launch", super::gui::Outcome::Shortcut("")))
+        let none: Vec<String> = #[]
+        assert_eq(super::quit_reserved(m), none)
+    }
+
+    #[test]
+    fn can_grab_accepts_single_keys_and_refuses_the_rest() {
+        assert(super::hotkey::can_grab("Ctrl+Space"))
+        assert(super::hotkey::can_grab("Ctrl+Alt+T"))
+        assert(super::hotkey::can_grab("F9"))
+        // A chord, a plain letter, a made-up key, an empty text.
+        assert(!super::hotkey::can_grab("Ctrl+Shift+T Ctrl+X"))
+        assert(!super::hotkey::can_grab("T"))
+        assert(!super::hotkey::can_grab("Ctrl+Help"))
+        assert(!super::hotkey::can_grab(""))
+    }
+}

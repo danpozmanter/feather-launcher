@@ -1,0 +1,42 @@
+// End-to-end checks of the built launcher, run from the Feather checkout
+// after `gos build --release .`. Each drives the real executable from
+// outside: processes, the X server, and mock desktop services on a private
+// session bus.
+use std::{env, errors, process}
+use daemon
+use focus
+use instance
+use shortcuts
+use wayland
+
+const USAGE: String = """
+Usage: gos run e2e/src/main.gos CHECK [OPTION]
+
+  instance [--desktop-mock]  concurrency and crash recovery (KDE mock: needs X11, dbus-daemon)
+  daemon [--x11]             --daemon behavior (--x11 adds focus checks)
+  focus                      X11 focus and stacking (needs libXtst)
+  shortcuts                  X11 shortcut recording (needs libXtst)
+  wayland                    KDE and portal shortcuts on Wayland, mocked (needs X11, dbus-daemon, PyGObject)
+"""
+
+fn run(args: Vec<String>) -> Result<(), errors::Error> {
+    let check = if args.len() > 0 { args[0] } else { "" }
+    let option = if args.len() > 1 { args[1] } else { "" }
+    match (check, option) {
+        ("instance", "") => instance::check(false)
+        ("instance", "--desktop-mock") => instance::check(true)
+        ("daemon", "") => daemon::check(false)
+        ("daemon", "--x11") => daemon::check(true)
+        ("focus", "") => focus::check()
+        ("shortcuts", "") => shortcuts::check()
+        ("wayland", "") => wayland::check()
+        _ => Err(errors::new(USAGE))
+    }
+}
+
+fn main() {
+    if let Err(e) = run(env::args()) {
+        eprintln(f"FAIL: {e}")
+        process::exit(1)
+    }
+}
