@@ -1,5 +1,5 @@
 [project]
 id = "dev.gossamer/feather-e2e"
 version = "0.1.0"
-gossamer-version = "^v0.75.15"
+gossamer-version = "^v0.75.16"
 entry = "src/main.gos"

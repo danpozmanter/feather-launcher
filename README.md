@@ -15,7 +15,7 @@ gos build --release .         # target/release/feather-launcher
 feather-launcher --daemon     # start hidden, detached from the terminal
 ```
 
-Requires libdbus; building requires Gossamer 0.75.15+. The release builds need
+Requires libdbus; building requires Gossamer 0.75.16+. The release builds need
 glibc 2.39+ (Ubuntu 24.04, Fedora 40, Debian 13).
 `install.sh` also takes `--no-build` and `--prefix /absolute/path`; it does not
 start Feather or enable autostart.
