@@ -9,16 +9,14 @@ description: Press Ctrl+Space, type a few letters of an application's name, pres
 
 # Feather Launcher
 
-<p class="tagline">Press <kbd>Ctrl</kbd>+<kbd>Space</kbd>, type a few letters, press <kbd>Enter</kbd>.</p>
+<p class="tagline">A lightweight application launcher.</p>
 
 [Get Feather](installation.md){ .md-button .md-button--primary }
 [View on GitHub](https://github.com/danpozmanter/feather-launcher){ .md-button }
 
 </div>
 
-Feather is an application launcher. It waits in the background,
-appears at the top of the screen on a global shortcut, and starts any desktop
-application by a fuzzy match on its name.
+A simple application launcher that aims to stay small and efficient.
 
 ## Built With
 
