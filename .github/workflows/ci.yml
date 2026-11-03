@@ -38,6 +38,8 @@ jobs:
           curl -fsSL "https://raw.githubusercontent.com/${GOSSAMER_REPO}/main/scripts/install.sh" | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: gos --version
+      - name: Fetch the GUI libraries
+        run: gos fetch
       - name: Format, lint and check
         run: |
           gos fmt --check
