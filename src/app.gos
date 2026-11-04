@@ -19,7 +19,7 @@ pub const ICON_SVG: String = comptime { fs::read_to_string("assets/feather-launc
 /// Feather's accent: the selected result, buttons, and focused fields.
 pub const BRONZE: gui::Color = gui::Color::hex(0xB05E24)
 const FOCUS: gui::Color = gui::Color::hex(0x5C3112)
-pub const APP_VERSION: String = "0.1.0"
+pub const APP_VERSION: String = "0.1.1"
 
 // Default global launch shortcut and window-local quit shortcut.
 pub const DEFAULT_LAUNCH_KEY: String = "Ctrl+Space"
