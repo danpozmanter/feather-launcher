@@ -1,0 +1,225 @@
+// The user's settings: the shortcuts and how the run box looks, stored in
+// the application's configuration directory and edited in the Settings
+// window. Only values that differ from the defaults are stored, so the
+// defaults keep following the desktop.
+use std::errors
+use gui
+use gui::{Effect, ThemeKind}
+use gui::services
+use gui::style::Typography
+use windowing
+use app
+
+// The layout of the stored settings; a change of meaning bumps it.
+const FORMAT: i64 = 1
+
+/// The interface Feather draws: the shortcuts, the run box's font, and the
+/// colors around it.
+#[derive(PartialEq)]
+pub struct Settings {
+    /// The global launch hotkey, in `Shortcut::parse` text form; "" is off.
+    pub launch_key: String
+    /// The window-local quit shortcut; "" is off.
+    pub quit_key: String
+    /// The run box's font family; empty takes the interface font.
+    pub font: String
+    /// The run box's text size in points, before the desktop's text scaling.
+    pub font_size: f64
+    /// "system" follows the desktop's light or dark choice; "light" or "dark".
+    pub theme: String
+    /// Whether results and the run box show application icons.
+    pub icons: bool
+    /// The run box's focused edge, the selected result and the buttons, as
+    /// `#rrggbb`.
+    pub highlight: String
+}
+
+/// Feather's own highlight: bronze.
+pub const BRONZE: gui::Color = gui::Color::hex(0xB05E24)
+// The focus outline that goes with bronze.
+const BRONZE_FOCUS: gui::Color = gui::Color::hex(0x5C3112)
+// A custom highlight's focus outline lies this far from it toward black,
+// as bronze's own does.
+const FOCUS_DEPTH: f64 = 0.48
+
+pub const DEFAULT_LAUNCH_KEY: String = "Ctrl+Space"
+pub const DEFAULT_QUIT_KEY: String = "Ctrl+Shift+Q"
+pub const FONT_SIZE_MIN: f64 = 6.0
+pub const FONT_SIZE_MAX: f64 = 48.0
+/// The theme choices, by their stored value, with their labels.
+pub const THEMES: [(String, String); 3] = [("system", "System"), ("light", "Light"), ("dark", "Dark")]
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings {
+            launch_key: DEFAULT_LAUNCH_KEY, quit_key: DEFAULT_QUIT_KEY, font: "", font_size: body_points(), theme: "system", icons: true
+            highlight: BRONZE.css()
+        }
+    }
+}
+
+// The toolkit's body text size in points: its type ramp sets it in
+// interface units, 96 to the inch.
+fn body_points() -> f64 {
+    Typography::standard().body.size * 72.0 / 96.0
+}
+
+/// The defaults on this desktop: its interface font's size where it names one.
+pub fn defaults() -> Settings {
+    let mut d = Settings::default()
+    if let Some(points) = windowing::system::preferences().font_size && points >= FONT_SIZE_MIN && points <= FONT_SIZE_MAX {
+        d.font_size = points
+    }
+    d
+}
+
+fn file() -> String {
+    services::settings_path(app::APP_ID, "settings")
+}
+
+/// The stored settings over the defaults; a missing file answers the
+/// defaults.
+pub fn load() -> Result<Settings, errors::Error> { load_from(file()) }
+
+/// Stores the values of `s` that differ from the defaults.
+pub fn save(s: Settings) -> Result<(), errors::Error> { save_to(file(), s) }
+
+fn load_from(path: String) -> Result<Settings, errors::Error> {
+    let stored = services::load_settings(path, FORMAT, |_, s| s)?
+    Ok(with_values(defaults(), stored.values))
+}
+
+fn save_to(path: String, s: Settings) -> Result<(), errors::Error> {
+    let d = values(defaults())
+    let mut stored = services::Settings { version: FORMAT, values: Map::new() }
+    for (key, value) in values(s) {
+        if !d.any(|kv| kv.0 == key && kv.1 == value) { stored.set(key, value) }
+    }
+    services::save_settings(path, stored)
+}
+
+fn flag(on: bool) -> String {
+    if on { "true" } else { "false" }
+}
+
+fn values(s: Settings) -> Vec<(String, String)> {
+    #[
+        ("launch_key", s.launch_key), ("quit_key", s.quit_key), ("font", s.font), ("font_size", f"{s.font_size}"), ("theme", s.theme)
+        ("icons", flag(s.icons)), ("highlight", s.highlight)
+    ]
+}
+
+// The flag `v` holds, if it holds one.
+fn flag_of(v: String) -> Option<bool> {
+    match v { "true" => Some(true), "false" => Some(false), _ => None }
+}
+
+/// `s` with the fields `values` names replaced, each one kept when its new
+/// value is out of range.
+pub fn with_values(s: Settings, values: Map<String, String>) -> Settings {
+    let mut out = s
+    if let Some(v) = values.get("launch_key") && (v == "" || gui::Shortcut::parse(v).is_some()) { out.launch_key = v }
+    if let Some(v) = values.get("quit_key") && (v == "" || gui::Shortcut::parse(v).is_some()) { out.quit_key = v }
+    if let Some(v) = values.get("font") { out.font = v.trim() }
+    if let Some(v) = values.get("font_size") && let Some(size) = v.to_f64() && size >= FONT_SIZE_MIN && size <= FONT_SIZE_MAX { out.font_size = size }
+    if let Some(v) = values.get("theme") && THEMES.any(|t| t.0 == v) { out.theme = v }
+    if let Some(v) = values.get("icons").and_then(flag_of) { out.icons = v }
+    if let Some(v) = values.get("highlight") && let Some(c) = gui::Color::parse_css(v) { out.highlight = c.with_alpha(255).css() }
+    out
+}
+
+/// The highlight `s` names; bronze when it names none.
+pub fn highlight(s: Settings) -> gui::Color {
+    gui::Color::parse_css(s.highlight).unwrap_or(BRONZE)
+}
+
+/// The keyboard focus outline that goes with the highlight of `s`.
+pub fn focus(s: Settings) -> gui::Color {
+    let h = highlight(s)
+    if h == BRONZE { BRONZE_FOCUS } else { h.mix(gui::Color::black(), FOCUS_DEPTH).with_alpha(255) }
+}
+
+/// The run box's text size in points under `s`; 0 at the default size, so
+/// the run box keeps following the desktop's interface font.
+pub fn font_points(s: Settings) -> f64 {
+    if s.font_size == defaults().font_size { 0.0 } else { s.font_size }
+}
+
+/// The effect that puts the theme of `s` in place.
+pub fn theme_effect(s: Settings) -> Effect {
+    match s.theme {
+        "light" => Effect::SetTheme(ThemeKind::Light)
+        "dark" => Effect::SetTheme(ThemeKind::Dark)
+        _ => Effect::FollowSystemTheme
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path}
+
+    use super::Settings
+
+    fn stored(s: Settings) -> Map<String, String> {
+        let mut map: Map<String, String> = Map::new()
+        for (k, v) in super::values(s) { map[k] = v }
+        map
+    }
+
+    #[test]
+    fn stored_values_read_back_as_the_same_settings() {
+        let s = Settings { launch_key: "Ctrl+Alt+L", quit_key: "", font: "DejaVu Serif", font_size: 17.5, theme: "dark", icons: false, highlight: "#3366cc" }
+        assert_eq(super::with_values(Settings::default(), stored(s)), s)
+    }
+
+    #[test]
+    fn saved_settings_load_back_and_only_changes_are_written() {
+        let dir = fs::temp_dir("feather-settings").unwrap()
+        let file = path::join(dir, "settings.json")
+        assert_eq(super::load_from(file).unwrap(), super::defaults())
+        super::save_to(file, super::defaults()).unwrap()
+        let untouched = fs::read_to_string(file).unwrap()
+        let s = Settings { font: "DejaVu Serif", icons: false, ..super::defaults() }
+        super::save_to(file, s).unwrap()
+        let written = fs::read_to_string(file).unwrap()
+        assert_eq(super::load_from(file).unwrap(), s)
+        fs::remove_dir_all(dir).unwrap()
+        assert(!untouched.contains("launch_key"), untouched)
+        assert(written.contains("DejaVu Serif") && !written.contains("launch_key"), written)
+    }
+
+    #[test]
+    fn values_out_of_range_keep_the_setting_they_would_replace() {
+        let s = super::with_values(Settings::default(), { "font_size": "200", "theme": "sepia", "icons": "maybe", "highlight": "not a color", "launch_key": "Ctrl+Nonsense+" })
+        assert_eq(s, Settings::default())
+    }
+
+    #[test]
+    fn a_highlight_is_stored_opaque_in_canonical_form() {
+        let s = super::with_values(Settings::default(), { "highlight": "#3366CC80" })
+        assert_eq(s.highlight, "#3366cc")
+        assert_eq(super::highlight(s), super::gui::Color::hex(0x3366CC))
+    }
+
+    #[test]
+    fn the_focus_outline_follows_the_highlight_and_keeps_bronzes_own() {
+        assert_eq(super::focus(Settings::default()), super::gui::Color::hex(0x5C3112))
+        let blue = super::focus(Settings { highlight: "#3366cc", ..Settings::default() })
+        assert_eq(blue.a, 255)
+        assert(blue.b < 0xCC && blue.b > 0x40, f"{blue.css()}")
+    }
+
+    #[test]
+    fn the_default_size_follows_the_desktop_and_another_is_set_in_points() {
+        let d = super::defaults()
+        assert_eq(super::font_points(d), 0.0)
+        assert_eq(super::font_points(Settings { font_size: d.font_size + 4.0, ..d }), d.font_size + 4.0)
+    }
+
+    #[test]
+    fn each_theme_choice_names_its_effect() {
+        assert_eq(super::theme_effect(Settings::default()), super::Effect::FollowSystemTheme)
+        assert_eq(super::theme_effect(Settings { theme: "dark", ..Settings::default() }), super::Effect::SetTheme(super::ThemeKind::Dark))
+        assert_eq(super::theme_effect(Settings { theme: "light", ..Settings::default() }), super::Effect::SetTheme(super::ThemeKind::Light))
+    }
+}

@@ -476,7 +476,7 @@ fn kde_loop(b: bus::Bus, reg: desktop::Registration, mailbox: gui::Mailbox, upda
                 desktop::Event::Rebound(text) => {
                     current = text
                     active = text != ""
-                    bound(mailbox, text)
+                    mailbox.post(gui::UiMsg::Custom("hotkey.rebound", text))
                     status(mailbox, f"System Settings set the launch hotkey to {described(text)}.")
                 }
                 desktop::Event::Released | desktop::Event::Unrelated => ()

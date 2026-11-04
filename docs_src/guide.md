@@ -46,6 +46,21 @@ Click the gear to the left of the entry box. **Change...** records a new
 launch or quit shortcut: press the combination, then **Set** or ++enter++.
 **Clear**, then **Set**, switches a shortcut off. Changes apply immediately.
 
+Under **Appearance**:
+
+| Setting | Effect |
+|---|---|
+| Font | The run box's typeface, from the fonts installed; the default is the interface font |
+| Font size | The run box's text, in points; the default is your desktop's interface font size |
+| Theme | **System** follows the desktop's light or dark choice; **Light** and **Dark** keep one |
+| Show icons | Application icons beside results and in the run box; on by default |
+| Highlight color | The run box's edge, the selected result and the buttons; bronze by default |
+
+**Reset to Defaults** brings every setting back, the shortcuts included.
+Feather keeps the settings that differ from the defaults in
+`~/.config/dev.gossamer.feather-launcher/settings.json` (under
+`$XDG_CONFIG_HOME` when it is set).
+
 !!! note "Desktop shortcuts"
     On X11, Feather grabs its shortcut itself. On Wayland, KDE's shortcut
     service or the desktop portal (GNOME 48+, Hyprland) assigns it, and the

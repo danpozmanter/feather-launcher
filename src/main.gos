@@ -10,6 +10,7 @@ use daemon
 use fixture
 use hotkey
 use instance
+use settings
 use wake
 use windows
 
@@ -63,8 +64,9 @@ fn run(owner: Option<i32>) -> Result<(), errors::Error> {
 fn run_session(mut s: gui::Session, owner: Option<i32>) -> Result<(), errors::Error> {
     windows::prepare(s)?
     let is_fixture = env::args().contains("--fixture")
-    let mut initial = app::init(is_fixture)
+    let mut initial = app::init(is_fixture, if is_fixture { settings::defaults() } else { chosen_settings() })
     initial.shown = !daemon::is_child()
+    gui::perform(settings::theme_effect(initial.settings))
     let shown = Shared::new(if initial.shown { 1 } else { 0 }) // 0 hidden, 1 shown, 2 quit.
     let activations = Shared::new(0)
     // Wayland activation tokens of requests to show the launcher.
@@ -72,7 +74,7 @@ fn run_session(mut s: gui::Session, owner: Option<i32>) -> Result<(), errors::Er
     let tx, rx = channel(16)
     let rebind = wake::new()?
     defer rebind.close()
-    let mut sent = #[app::DEFAULT_LAUNCH_KEY]
+    let mut sent = #[initial.launch_key]
     let mut cell = #[initial]
     s.set_shell(
         |msg: UiMsg| {
@@ -97,13 +99,24 @@ fn run_session(mut s: gui::Session, owner: Option<i32>) -> Result<(), errors::Er
     s.flush()?
     if is_fixture { return fixture::run(s, shown, rx) }
     daemon::ready()?
-    serve(s, shown, activations, token_rx, rx, rebind, owner)
+    serve(s, shown, activations, token_rx, rx, rebind, owner, initial.launch_key)
+}
+
+// The stored settings; unreadable ones leave the defaults in place.
+fn chosen_settings() -> settings::Settings {
+    match settings::load() {
+        Ok(s) => s
+        Err(why) => {
+            eprintln(f"feather-launcher: ignoring unreadable settings: {why}")
+            settings::defaults()
+        }
+    }
 }
 
 // The hotkey and instance watchers block in poll(2), so every child gets its
 // own thread. `shutdown` releases them; the cohort joins all background work
 // before run() shuts down the GUI session, on error paths too.
-fn serve(s: gui::Session, shown: Shared<i64>, activations: Shared<i64>, tokens: Receiver<String>, updates: Receiver<String>, rebind: wake::Wake, owner: Option<i32>) -> Result<(), errors::Error> {
+fn serve(s: gui::Session, shown: Shared<i64>, activations: Shared<i64>, tokens: Receiver<String>, updates: Receiver<String>, rebind: wake::Wake, owner: Option<i32>, launch_key: String) -> Result<(), errors::Error> {
     let mailbox = s.mailbox()
     let shutdown = wake::new()?
     defer shutdown.close()
@@ -111,7 +124,7 @@ fn serve(s: gui::Session, shown: Shared<i64>, activations: Shared<i64>, tokens: 
     let mut result = Ok(())
     let joined = cohort(isolation: Isolation::Thread) {
         spawn(|| catalog::watch(mailbox, checks_rx))
-        spawn(|| hotkey::watch(mailbox, updates, rebind, shutdown, app::DEFAULT_LAUNCH_KEY))
+        spawn(|| hotkey::watch(mailbox, updates, rebind, shutdown, launch_key))
         spawn(|| if let Some(fd) = owner { instance::watch(fd, mailbox, shutdown) } else { Ok(()) })
         result = drive(s, shown, activations, tokens, checks)
         checks.close()

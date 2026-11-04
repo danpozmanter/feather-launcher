@@ -15,7 +15,7 @@ gos build --release .         # target/release/feather-launcher
 feather-launcher --daemon     # start hidden, detached from the terminal
 ```
 
-Requires libdbus; building requires Gossamer 0.75.17+. The release builds need
+Requires libdbus; building requires Gossamer 0.76.0+. The release builds need
 glibc 2.39+ (Ubuntu 24.04, Fedora 40, Debian 13).
 `install.sh` also takes `--no-build` and `--prefix /absolute/path`; it does not
 start Feather or enable autostart.
@@ -37,7 +37,10 @@ start Feather or enable autostart.
 - The catalog and icons rebuild in the background whenever a desktop entry
   under the XDG application folders changes.
 - One instance runs per user; starting it again shows the existing one.
-- The settings icon left of the entry box rebinds both shortcuts live.
+- The settings icon left of the entry box rebinds both shortcuts live and
+  sets the run box's font, font size, theme (system, light or dark), icons,
+  and highlight color. Settings are kept between runs; Reset to Defaults
+  brings them all back.
 
 ## Platform notes
 

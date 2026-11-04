@@ -4,9 +4,10 @@ use std::sync::{Receiver, Shared}
 use gui
 use gui::{UiMsg}
 use windowing::{Key, Mods}
-use app::DEFAULT_LAUNCH_KEY
+use settings::DEFAULT_LAUNCH_KEY
 use windows
 use hotkey
+use settings
 
 // Reads one rebinding from the channel the update closure posts to. `want`
 // is what must have arrived, or None when nothing may have.
@@ -127,6 +128,7 @@ pub fn run(mut s: gui::Session, shown: Shared<i64>, rx: Receiver<String>) -> Res
     s.close_dialog("shortcut.launch", gui::Outcome::Cancelled)
     s.flush()?
     if s.window_count() != 2 { return Err(errors::new("Settings did not open")) }
+    appearance(s, rx)?
     let settings_id = s.window_id(1)
     s.inject(windowing::Event::KeyDown { window: settings_id, key: Key::Escape, scancode: windowing::Scancode::Unknown, mods: Mods::default(), repeat: false })?
     if s.window_count() != 1 { return Err(errors::new("Escape did not close Settings")) }
@@ -165,10 +167,37 @@ pub fn run(mut s: gui::Session, shown: Shared<i64>, rx: Receiver<String>) -> Res
         if shown.get() != 2 { return Err(errors::new("Ctrl+Shift+Q in Settings did not quit Feather")) }
     }
 
-    println("feather-launcher: stable completion sizing, startup focus, Escape over completion, command lines, stable window identity, settings icon, Settings Escape and X, shortcut rebinding, and Ctrl+Shift+Q passed; no process started")
+    println("feather-launcher: stable completion sizing, startup focus, Escape over completion, command lines, stable window identity, settings icon, Settings Escape and X, shortcut rebinding, appearance settings and their reset, and Ctrl+Shift+Q passed; no process started")
     Ok(())
 }
 
+// The Settings window offers every appearance setting; a larger font grows
+// the run box and its window, and Reset to Defaults brings the compact
+// window back without touching the launch hotkey it already holds.
+fn appearance(mut s: gui::Session, rx: Receiver<String>) -> Result<(), errors::Error> {
+    let shown = s.semantics(1).dump()
+    for want in #["Font size", "Theme", "Show icons", "Highlight color", "Reset to Defaults"] {
+        if !shown.contains(want) { return Err(errors::new(f"Settings does not offer {want}: {shown}")) }
+    }
+    let Some(field) = s.rect_of("run") else { return Err(errors::new("The run box is missing")) }
+    let window = s.window_pixel_size(0)
+    s.emit(UiMsg::Value("settings.font-size", settings::FONT_SIZE_MAX))
+    s.emit(UiMsg::Select("settings.font", "Feather Fixture Missing Family"))
+    s.emit(UiMsg::Choose("settings.theme", "dark"))
+    s.emit(UiMsg::Toggle("settings.icons", false))
+    s.flush()?
+    s.advance(1)?
+    let Some(large) = s.rect_of("run") else { return Err(errors::new("The run box is missing")) }
+    if large.height <= field.height { return Err(errors::new(f"A larger font did not grow the run box: {field} became {large}")) }
+    if s.window_pixel_size(0).1 < large.y + large.height { return Err(errors::new(f"The launcher did not grow to hold a larger run box: {s.window_pixel_size(0)} for {large}")) }
+    s.emit(UiMsg::Click("settings.reset"))
+    s.flush()?
+    s.advance(1)?
+    expect_binding(rx, None)?
+    if s.rect_of("run") != Some(field) { return Err(errors::new(f"Reset to Defaults did not restore the run box: {field} became {s.rect_of("run")}")) }
+    if s.window_pixel_size(0) != window { return Err(errors::new("Reset to Defaults did not restore the compact launcher")) }
+    Ok(())
+}
 
 // Search refinement must not move the field, drift in size for repeated
 // queries, or continue resizing after completion settles.

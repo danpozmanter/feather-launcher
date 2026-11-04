@@ -8,30 +8,31 @@ use gui::services::apps::AppEntry
 use gui::widgets::completion::{Completion, CompletionItem}
 use gui::widgets::cx::TaskOutcome
 use gui::widgets::display
+use gui::text::catalog::FontRecord
 use gui::text::layout::TextAlign
 use gui::widgets::textinput::{InputKind, TextInput}
 use command
 use command::Invocation
 use hotkey
 use search
+use settings
+use settings::Settings
 
 pub const APP_ID: String = "dev.gossamer.feather-launcher"
 /// Feather's icon, embedded so a build run from anywhere shows it.
 pub const ICON_SVG: String = comptime { fs::read_to_string("assets/feather-launcher.svg").unwrap() }
-/// Feather's accent: the selected result, buttons, and focused fields.
-pub const BRONZE: gui::Color = gui::Color::hex(0xB05E24)
-const FOCUS: gui::Color = gui::Color::hex(0x5C3112)
-pub const APP_VERSION: String = "0.2.0"
-
-// Default global launch shortcut and window-local quit shortcut.
-pub const DEFAULT_LAUNCH_KEY: String = "Ctrl+Space"
-const DEFAULT_QUIT_KEY: String = "Ctrl+Shift+Q"
+pub const APP_VERSION: String = "0.3.0"
 
 // The Settings window's size in interface units: everything fits without
-// wrapping a description or scrolling. It is also the smallest the window gets,
-// so a smaller remembered size cannot crowd the content.
+// wrapping a description or scrolling. The width is also the smallest the
+// window gets, so a narrower remembered size cannot crowd the rows; a shorter
+// window scrolls its body.
 const SETTINGS_WIDTH: i64 = 900
-const SETTINGS_HEIGHT: i64 = 640
+const SETTINGS_HEIGHT: i64 = 960
+const SETTINGS_MIN_HEIGHT: i64 = 640
+
+// The width of a setting's control that takes text, in interface units.
+const CONTROL_WIDTH: i64 = 300
 
 // Proposals the list holds; it shows eight and scrolls.
 const PROPOSALS: i64 = 50
@@ -58,13 +59,19 @@ pub struct Model {
     pub shown: bool
     /// The driver exits after this update.
     pub quit: bool
-    /// The global launch hotkey and the extra quit shortcut, in
-    /// `Shortcut::parse` text form. "" switches a shortcut off.
+    /// The global launch hotkey the watcher holds, in `Shortcut::parse`
+    /// text form; "" is off. It differs from the chosen one while a grab
+    /// fails.
     pub launch_key: String
     /// Temporarily release the global grab while a shortcut is recorded.
     pub capturing_shortcut: bool
-    quit_key: String
-    /// What the last shortcut change did, shown in the Settings window.
+    /// What the user chose, stored between runs.
+    pub settings: Settings
+    /// A launch hotkey chosen in Settings waits for the watcher's answer.
+    launch_requested: bool
+    /// The installed font families, once loaded for the Settings window.
+    fonts: Vec<String>
+    /// What the last settings change did, shown in the Settings window.
     settings_note: String
     /// Feather's icon, drawn once for the Settings header.
     logo: Option<gui::AppIcon>
@@ -72,7 +79,7 @@ pub struct Model {
 
 fn fixture_entry(id: String, name: String, program: String) -> AppEntry {
     let glyph = if id == "terminal" { gui::Icon::Terminal } else if id == "editor" { gui::Icon::FileText } else { gui::Icon::Grid }
-    let image = gui::AppIcon::drawn(glyph, 32, BRONZE, gui::Color::white())
+    let image = gui::AppIcon::drawn(glyph, 32, settings::BRONZE, gui::Color::white())
     AppEntry { id: id, name: name, generic_name: String::new(), comment: String::new(), icon: String::new(), keywords: #[], categories: #[], exec: #[program], terminal: false, source: String::new(), image: Some(image) }
 }
 
@@ -85,7 +92,9 @@ fn fixture_catalog() -> Vec<AppEntry> {
     #[calculator, editor, fixture_entry("terminal", "Terminal", "x-terminal-emulator")]
 }
 
-pub fn init(fixture: bool) -> Model {
+/// The model at start, showing the settings `chosen`. A fixture run uses
+/// fixture applications and stores nothing.
+pub fn init(fixture: bool, chosen: Settings) -> Model {
     Model {
         apps: if fixture { fixture_catalog() } else { #[] }
         loading: !fixture
@@ -94,9 +103,11 @@ pub fn init(fixture: bool) -> Model {
         // hides it and the hotkey raises it again.
         shown: true
         quit: false
-        launch_key: DEFAULT_LAUNCH_KEY
+        launch_key: chosen.launch_key
         capturing_shortcut: false
-        quit_key: DEFAULT_QUIT_KEY
+        settings: chosen
+        launch_requested: false
+        fonts: #[]
         settings_note: ""
         logo: gui::AppIcon::from_svg(ICON_SVG, 104).ok()
     }
@@ -117,17 +128,19 @@ fn target(apps: Vec<AppEntry>, typed: Option<Invocation>, text: String) -> Optio
     typed.map(|c| Target::Command(c))
 }
 
-fn app_item(e: AppEntry, query: String) -> CompletionItem {
+fn app_item(e: AppEntry, query: String, icons: bool) -> CompletionItem {
     let mut item = CompletionItem::new(e.id, e.name).with_detail(e.generic_name)
-    item.image = e.image
-    item.icon = Some(gui::Icon::Grid)
+    if icons {
+        item.image = e.image
+        item.icon = Some(gui::Icon::Grid)
+    }
     item.matches = search::highlights(e.name, query)
     item
 }
 
-fn command_item(c: Invocation) -> CompletionItem {
+fn command_item(c: Invocation, icons: bool) -> CompletionItem {
     let mut item = CompletionItem::new(command::KEY, c.text).with_detail(c.argv[0])
-    item.icon = Some(gui::Icon::Terminal)
+    if icons { item.icon = Some(gui::Icon::Terminal) }
     item
 }
 
@@ -137,11 +150,12 @@ fn command_item(c: Invocation) -> CompletionItem {
 fn proposals(m: Model, query: String) -> Vec<CompletionItem> {
     let typed = command::parse(query)
     let room = if typed.is_some() { PROPOSALS - 1 } else { PROPOSALS }
-    let apps = search::find(m.apps, query, room).map(|e| app_item(e, query))
+    let icons = m.settings.icons
+    let apps = search::find(m.apps, query, room).map(|e| app_item(e, query, icons))
     let mut out = #[]
-    if let Some(c) = typed && c.has_arguments() { out.push(command_item(c)) }
+    if let Some(c) = typed && c.has_arguments() { out.push(command_item(c, icons)) }
     for item in apps { out.push(item) }
-    if let Some(c) = typed && !c.has_arguments() { out.push(command_item(c)) }
+    if let Some(c) = typed && !c.has_arguments() { out.push(command_item(c, icons)) }
     let n = out.len()
     // The list sorts by score; descending scores keep this order.
     out.iter().enumerate().map(|(i, item)| {
@@ -228,8 +242,32 @@ pub fn update(m: Model, msg: UiMsg) -> Model {
     match msg {
         UiMsg::Custom(id, _) if id == "hotkey" => n = if n.shown { hide(n) } else { show(n) }
         UiMsg::Custom(id, _) if id == "activate" => n = show(n)
-        UiMsg::Custom(id, text) if id == "hotkey.status" => if !n.capturing_shortcut { n.settings_note = text }
-        UiMsg::Custom(id, text) if id == "hotkey.bound" => n.launch_key = text
+        UiMsg::Custom(id, text) if id == "hotkey.status" => {
+            n.launch_requested = false
+            if !n.capturing_shortcut { n.settings_note = text }
+        }
+        // A binding restored after a chosen one failed becomes the choice;
+        // one restored at start leaves the stored choice for the next run.
+        UiMsg::Custom(id, text) if id == "hotkey.bound" => {
+            n.launch_key = text
+            if n.launch_requested { n = store(n, Settings { launch_key: text, ..n.settings }) }
+        }
+        UiMsg::Custom(id, text) if id == "hotkey.rebound" => {
+            n.launch_key = text
+            n = store(n, Settings { launch_key: text, ..n.settings })
+        }
+        UiMsg::FontsLoaded(id, records) => if id == "settings" { n.fonts = families(records) }
+        UiMsg::Value(id, size) if id == "settings.font-size" => {
+            let points = size.max(settings::FONT_SIZE_MIN).min(settings::FONT_SIZE_MAX)
+            n = store(n, Settings { font_size: points, ..n.settings })
+        }
+        UiMsg::Choose(id, theme) if id == "settings.theme" => {
+            n = store(n, Settings { theme: theme, ..n.settings })
+            gui::perform(settings::theme_effect(n.settings))
+        }
+        UiMsg::Toggle(id, on) if id == "settings.icons" => n = store(n, Settings { icons: on, ..n.settings })
+        UiMsg::Select(id, family) if id == "settings.font" => n = store(n, Settings { font: family, ..n.settings })
+        UiMsg::Dialog(id, gui::Outcome::Color(c)) if id == "highlight" => n = store(n, Settings { highlight: c.with_alpha(255).css(), ..n.settings })
         UiMsg::CloseRequested(id) => if id == "main" { n = hide(n) }
         else if id == "settings" { gui::perform(Effect::CloseWindow("settings")) }
         UiMsg::QuitRequested => n = quit(n)
@@ -285,16 +323,50 @@ fn click(mut m: Model, id: String) -> Model {
         "app.settings" => open_settings()
         "settings.close" => gui::perform(Effect::CloseWindow("settings"))
         "settings.about" => gui::perform(Effect::OpenDialogIn("settings", about()))
-        "settings.quit-app" => { return quit(m) }
         "settings.launch" => gui::perform(Effect::OpenDialogIn("settings", gui::DialogRequest::Shortcut {
             id: "shortcut.launch", title: "Launch shortcut", initial: m.launch_key, reserved: launch_reserved(m)
         }))
         "settings.quit" => gui::perform(Effect::OpenDialogIn("settings", gui::DialogRequest::Shortcut {
-            id: "shortcut.quit", title: "Quit shortcut", initial: m.quit_key, reserved: quit_reserved(m)
+            id: "shortcut.quit", title: "Quit shortcut", initial: m.settings.quit_key, reserved: quit_reserved(m)
         }))
+        "settings.highlight" | "settings.highlight-swatch" => gui::perform(Effect::OpenDialogIn("settings", gui::DialogRequest::Color {
+            id: "highlight", title: "Highlight color", initial: settings::highlight(m.settings), alpha: false
+        }))
+        "settings.reset" => { return reset(m) }
         _ => ()
     }
     m
+}
+
+// Takes settings `chosen` and stores them; a fixture run keeps them in
+// memory only.
+fn store(mut m: Model, chosen: Settings) -> Model {
+    if chosen == m.settings { return m }
+    m.settings = chosen
+    if !m.fixture && let Err(why) = settings::save(chosen) { m.settings_note = f"Could not save the settings: {why}" }
+    m
+}
+
+// Every setting back to its default, the launch hotkey included.
+fn reset(m: Model) -> Model {
+    let d = settings::defaults()
+    let mut n = store(m, d)
+    if n.launch_key != d.launch_key {
+        n.launch_key = d.launch_key
+        n.launch_requested = true
+    }
+    gui::perform(settings::theme_effect(d))
+    n.settings_note = "Every setting is back to its default."
+    n
+}
+
+// The families of `records` that draw outlines, each once, in order.
+fn families(records: Vec<FontRecord>) -> Vec<String> {
+    let mut found: BTreeSet<String> = BTreeSet::new()
+    for r in records {
+        if !r.color && !r.family.is_empty() { found.insert(r.family) }
+    }
+    found.to_vec()
 }
 
 fn shortcut_changed(mut m: Model, id: String, text: String) -> Model {
@@ -307,11 +379,13 @@ fn shortcut_changed(mut m: Model, id: String, text: String) -> Model {
             m.settings_note = f"Feather cannot watch {text} globally; the launch hotkey stays {now}."
         } else {
             m.launch_key = text
+            m.launch_requested = true
             m.settings_note = f"Applying the launch hotkey {text}…"
         }
+        if m.launch_key == text { m = store(m, Settings { launch_key: text, ..m.settings }) }
     } else if id == "shortcut.quit" {
-        m.quit_key = text
-        m.settings_note = if text == "" { "The quit shortcut is off. Use Quit Feather in Settings." }
+        m = store(m, Settings { quit_key: text, ..m.settings })
+        m.settings_note = if text == "" { "The quit shortcut is off. Ctrl+Esc still quits Feather." }
         else { f"The quit shortcut is now {text}." }
     }
     m
@@ -320,8 +394,9 @@ fn shortcut_changed(mut m: Model, id: String, text: String) -> Model {
 // What the launch shortcut must not take: Ctrl+Esc always quits, and so does
 // the quit shortcut when one is set.
 fn launch_reserved(m: Model) -> Vec<String> {
+    let quit = m.settings.quit_key
     let mut r = #["Ctrl+Esc"]
-    if m.quit_key != "" && m.quit_key != "Ctrl+Esc" { r.push(m.quit_key) }
+    if quit != "" && quit != "Ctrl+Esc" { r.push(quit) }
     r
 }
 
@@ -339,23 +414,24 @@ fn about() -> gui::DialogRequest {
 
 fn open_settings() {
     gui::perform(Effect::OpenWindow { key: "settings", title: "Feather Settings", width: SETTINGS_WIDTH, height: SETTINGS_HEIGHT })
-    gui::perform(Effect::SetMinSize("settings", SETTINGS_WIDTH, SETTINGS_HEIGHT))
+    gui::perform(Effect::SetMinSize("settings", SETTINGS_WIDTH, SETTINGS_MIN_HEIGHT))
     gui::perform(Effect::FocusIn("settings", "settings.close"))
+    gui::perform(Effect::LoadFonts("settings"))
 }
 
 pub fn view(m: Model, window: String) -> Widget {
-    if window == "settings" { return styled(settings_view(m)) }
+    if window == "settings" { return styled(m.settings, settings_view(m)) }
     // Extra native height belongs to suggestions, not the centered entry row.
-    styled(Widget::row(#[
+    styled(m.settings, Widget::row(#[
         Widget::tool_button("app.settings", gui::Icon::Settings, "Settings")
         Widget::input(run_input(m)).grow(1)
     ], 8).padding(8).bordered().align(0.0, 0.0))
 }
 
-fn styled(widget: Widget) -> Widget {
+fn styled(s: Settings, widget: Widget) -> Widget {
     widget.themed(gui::ThemeOverride {
-        kind: None, density: None, rtl: None, text_scale: 0.0, tokens: None
-        focus: Some(FOCUS), accent: Some(BRONZE)
+        kind: None, density: None, rtl: None, text_scale: 0.0, tokens: None, surface: None, field: None
+        focus: Some(settings::focus(s)), accent: Some(settings::highlight(s))
     })
 }
 
@@ -365,6 +441,9 @@ fn run_input(m: Model) -> TextInput {
     let mut field = TextInput::new("run", m.query, "Application or command...", InputKind::Line)
     field.completion = Some(c)
     field.error = m.error
+    field.family = m.settings.font
+    field.font_points = settings::font_points(m.settings)
+    if !m.settings.icons { return field }
     field.leading_icon = Some(gui::Icon::Search)
     match target(m.apps, m.command, m.query) {
         Some(Target::App(e)) => {
@@ -377,7 +456,7 @@ fn run_input(m: Model) -> TextInput {
     field
 }
 
-// Settings and the result of the latest shortcut change. The footer stays
+// Settings and the result of the latest change to them. The footer stays
 // pinned while the body scrolls, so a short window never overlaps the two.
 // Focus runs from the launch shortcut's Change… button to Close, the last stop.
 fn settings_view(m: Model) -> Widget {
@@ -396,7 +475,26 @@ fn settings_view(m: Model) -> Widget {
     let shortcuts = Widget::card(Widget::column(#[
         shortcut_row("settings.launch", "Open Feather", "Shows or hides the run box.", m.launch_key)
         Widget::separator()
-        shortcut_row("settings.quit", "Quit Feather", "Ends Feather completely.", m.quit_key)
+        shortcut_row("settings.quit", "Quit Feather", "Ends Feather completely.", m.settings.quit_key)
+    ], 16))
+    let s = m.settings
+    let mut fonts = #[CompletionItem::new("", "Interface font")]
+    for family in m.fonts { fonts.push(CompletionItem::new(family, family)) }
+    if s.font != "" && !m.fonts.contains(s.font) { fonts.push(CompletionItem::new(s.font, s.font)) }
+    let appearance = Widget::card(Widget::column(#[
+        setting_row("Font", "The run box's typeface.", Widget::picker("settings.font", fonts, #[s.font], false, "Interface font").min_width(CONTROL_WIDTH))
+        Widget::separator()
+        setting_row("Font size", "The run box's text, in points.", Widget::spin_box("settings.font-size", s.font_size, settings::FONT_SIZE_MIN, settings::FONT_SIZE_MAX, 0.5, 1).min_width(CONTROL_WIDTH))
+        Widget::separator()
+        setting_row("Theme", "System follows the desktop's light or dark choice.", Widget::segmented("settings.theme", settings::THEMES.to_vec(), s.theme))
+        Widget::separator()
+        setting_row("Show icons", "Application icons beside results and in the run box.", Widget::switch("settings.icons", "", s.icons).accessible("Show icons"))
+        Widget::separator()
+        setting_row("Highlight color", "The run box's edge and the selected result.", Widget::flex(gui::Axis::Horizontal, #[
+            Widget::swatch_button("settings.highlight-swatch", settings::highlight(s), "Highlight color")
+            keycap(s.highlight)
+            Widget::button("settings.highlight", "Change…").min_width(120)
+        ], 16, gui::MainAlign::Start, gui::CrossAlign::Center))
     ], 16))
     let status = Widget::flex(gui::Axis::Horizontal, #[
         Widget::icon(gui::Icon::Info, 18)
@@ -408,11 +506,14 @@ fn settings_view(m: Model) -> Widget {
         Widget::text("Keyboard shortcuts", gui::TextRole::Label, gui::Tone::Normal)
         shortcuts
         status
+        Widget::spacer(8)
+        Widget::text("Appearance", gui::TextRole::Label, gui::Tone::Normal)
+        appearance
     ], 12).padding_sides(28, 24, 28, 16)
     let actions = Widget::flex(gui::Axis::Horizontal, #[
         Widget::button("settings.about", "About")
-        Widget::danger_button("settings.quit-app", "Quit Feather")
         Widget::stretch()
+        Widget::button("settings.reset", "Reset to Defaults")
         Widget::primary_button("settings.close", "Close").min_width(110)
     ], 10, gui::MainAlign::Start, gui::CrossAlign::Center).padding_xy(28, 16)
     Widget::column(#[
@@ -441,6 +542,17 @@ fn keycap(key: String) -> Widget {
     Widget::Text(l).min_width(200).padding_xy(10, 4).background(gui::Tone::Field).bordered().radius(6)
 }
 
+// One setting: what it changes on the left, its control on the right.
+fn setting_row(name: String, description: String, control: Widget) -> Widget {
+    Widget::flex(gui::Axis::Horizontal, #[
+        Widget::column(#[
+            Widget::text(name, gui::TextRole::Label, gui::Tone::Normal)
+            caption(description)
+        ], 4).grow(1)
+        control
+    ], 16, gui::MainAlign::Start, gui::CrossAlign::Center)
+}
+
 // One shortcut: what it does on the left, its binding and Change… on the right.
 fn shortcut_row(id: String, name: String, description: String, key: String) -> Widget {
     Widget::flex(gui::Axis::Horizontal, #[
@@ -455,7 +567,8 @@ fn shortcut_row(id: String, name: String, description: String, key: String) -> W
 
 pub fn commands(m: Model) -> Vec<gui::Command> {
     let mut quit = gui::Command::new("gui.quit", "Quit Feather").key("Ctrl+Esc")
-    if m.quit_key != "" && m.quit_key != "Ctrl+Esc" { quit = quit.key(m.quit_key) }
+    let key = m.settings.quit_key
+    if key != "" && key != "Ctrl+Esc" { quit = quit.key(key) }
     #[quit, gui::Command::new("app.close-settings", "Close Settings").key("Esc").in_scope("settings")]
 }
 
@@ -464,7 +577,7 @@ mod tests {
     use std::fs
     use gui::UiMsg
 
-    fn fixture() -> super::Model { super::init(true) }
+    fn fixture() -> super::Model { super::init(true, super::settings::defaults()) }
 
     #[test]
     fn the_box_opens_at_start_and_the_hotkey_toggles_it_with_a_fresh_query() {
@@ -671,16 +784,16 @@ mod tests {
     }
 
     #[test]
-    fn the_settings_button_opens_settings_and_quit_button_ends_the_app() {
+    fn settings_offers_no_quit_button_and_about_keeps_feather_running() {
         let mut m = fixture()
-        assert(m.shown)
         m = super::update(m, UiMsg::Click("app.settings"))
         m = super::update(m, UiMsg::Click("settings.about"))
         assert(!m.quit)
         assert(m.shown)
-        let m = super::update(m, UiMsg::Click("settings.quit-app"))
-        assert(m.quit)
-        assert(!m.shown)
+        let shown = format("{}", super::settings_view(m))
+        assert(shown.contains("settings.about") && !shown.contains("quit-app"))
+        m = super::update(m, UiMsg::Click("settings.quit-app"))
+        assert(!m.quit)
     }
 
     #[test]
@@ -729,11 +842,11 @@ mod tests {
         assert_eq(m.launch_key, "")
         // Quit rebinds the same way.
         m = super::update(m, UiMsg::Dialog("shortcut.quit", super::gui::Outcome::Shortcut("Ctrl+Alt+Q")))
-        assert_eq(m.quit_key, "Ctrl+Alt+Q")
+        assert_eq(m.settings.quit_key, "Ctrl+Alt+Q")
         // Cancelled: nothing changes.
         m = super::update(m, UiMsg::Dialog("shortcut.launch", super::gui::Outcome::Cancelled))
         assert_eq(m.launch_key, "")
-        assert_eq(m.quit_key, "Ctrl+Alt+Q")
+        assert_eq(m.settings.quit_key, "Ctrl+Alt+Q")
     }
 
     #[test]
@@ -748,6 +861,75 @@ mod tests {
         m = super::update(m, UiMsg::Dialog("shortcut.launch", super::gui::Outcome::Shortcut("")))
         let none: Vec<String> = #[]
         assert_eq(super::quit_reserved(m), none)
+    }
+
+    #[test]
+    fn appearance_settings_reach_the_model_and_the_run_box() {
+        let mut m = fixture()
+        m = super::update(m, UiMsg::Select("settings.font", "DejaVu Serif"))
+        m = super::update(m, UiMsg::Value("settings.font-size", 99.0))
+        m = super::update(m, UiMsg::Choose("settings.theme", "dark"))
+        m = super::update(m, UiMsg::Dialog("highlight", super::gui::Outcome::Color(super::gui::Color::hex(0x3366CC))))
+        assert_eq(m.settings.font, "DejaVu Serif")
+        assert_eq(m.settings.font_size, super::settings::FONT_SIZE_MAX)
+        assert_eq(m.settings.theme, "dark")
+        assert_eq(m.settings.highlight, "#3366cc")
+        assert_eq(super::run_input(m).family, "DejaVu Serif")
+        assert_eq(super::run_input(m).font_points, super::settings::FONT_SIZE_MAX)
+    }
+
+    #[test]
+    fn icons_off_leave_results_and_the_run_box_bare() {
+        let mut m = fixture()
+        m = super::update(m, UiMsg::Toggle("settings.icons", false))
+        m = super::update(m, UiMsg::Text("run", "term"))
+        let items = super::proposals(m, "term")
+        assert(items[0].image.is_none())
+        assert(items[0].icon.is_none())
+        assert(super::run_input(m).leading_image.is_none())
+        assert(super::run_input(m).leading_icon.is_none())
+        assert(super::proposals(m, "sh -c true").iter().all(|i| i.icon.is_none()))
+    }
+
+    #[test]
+    fn reset_brings_every_setting_and_the_launch_hotkey_back() {
+        let mut m = fixture()
+        m = super::update(m, UiMsg::Dialog("shortcut.launch", super::gui::Outcome::Shortcut("Ctrl+Alt+L")))
+        m = super::update(m, UiMsg::Dialog("shortcut.quit", super::gui::Outcome::Shortcut("")))
+        m = super::update(m, UiMsg::Toggle("settings.icons", false))
+        m = super::update(m, UiMsg::Choose("settings.theme", "light"))
+        assert(m.settings != super::settings::defaults())
+        m = super::update(m, UiMsg::Click("settings.reset"))
+        assert_eq(m.settings, super::settings::defaults())
+        assert_eq(m.launch_key, super::settings::DEFAULT_LAUNCH_KEY)
+        assert_eq(super::launch_reserved(m), #["Ctrl+Esc", "Ctrl+Shift+Q"])
+    }
+
+    #[test]
+    fn a_restored_hotkey_is_stored_only_after_a_change_the_user_made() {
+        let mut m = fixture()
+        // At start the watcher could not grab the stored key: the choice stays.
+        m = super::update(m, UiMsg::Custom("hotkey.bound", ""))
+        m = super::update(m, UiMsg::Custom("hotkey.status", "Could not bind Ctrl+Space"))
+        assert_eq(m.launch_key, "")
+        assert_eq(m.settings.launch_key, "Ctrl+Space")
+        // A change that fails stores what the watcher went back to.
+        m = super::update(m, UiMsg::Dialog("shortcut.launch", super::gui::Outcome::Shortcut("Ctrl+Alt+L")))
+        assert_eq(m.settings.launch_key, "Ctrl+Alt+L")
+        m = super::update(m, UiMsg::Custom("hotkey.bound", ""))
+        m = super::update(m, UiMsg::Custom("hotkey.status", "Could not bind Ctrl+Alt+L"))
+        assert_eq(m.settings.launch_key, "")
+        // The desktop's own rebinding is stored as it arrives.
+        m = super::update(m, UiMsg::Custom("hotkey.rebound", "Meta+Space"))
+        assert_eq(m.launch_key, "Meta+Space")
+        assert_eq(m.settings.launch_key, "Meta+Space")
+    }
+
+    #[test]
+    fn the_font_list_holds_each_outline_family_once_in_order() {
+        let face = |family: String, color: bool| super::FontRecord { family: family, color: color, ..super::FontRecord::default() }
+        let m = super::update(fixture(), UiMsg::FontsLoaded("settings", #[face("Noto Sans", false), face("Cantarell", false), face("Noto Sans", false), face("Noto Color Emoji", true)]))
+        assert_eq(m.fonts, #["Cantarell", "Noto Sans"])
     }
 
     #[test]
