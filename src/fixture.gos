@@ -67,6 +67,20 @@ pub fn run(mut s: gui::Session, shown: Shared<i64>, rx: Receiver<String>) -> Res
     windows::hide(s)?
     if s.window_visible(0) { return Err(errors::new("the launch hid the model but the window stayed up")) }
 
+    // A command line is proposed above every application, and Enter runs it.
+    s.emit(UiMsg::Custom("hotkey", ""))
+    s.flush()?
+    windows::show(s)?
+    s.type_text("sh -c true")?
+    s.advance(1)?
+    if !s.semantics(0).dump().contains("listitem \"sh -c true\"") {
+        return Err(errors::new(f"typing a command line proposed no command: {s.semantics(0).dump()}"))
+    }
+    s.press(Key::Return, Mods::default())?
+    s.flush()?
+    if shown.get() != 0 { return Err(errors::new("running a command did not hide the run box")) }
+    windows::hide(s)?
+
     s.emit(UiMsg::Custom("hotkey", ""))
     s.flush()?
     if shown.get() == 0 { return Err(errors::new("the hotkey did not show the run box again")) }
@@ -151,7 +165,7 @@ pub fn run(mut s: gui::Session, shown: Shared<i64>, rx: Receiver<String>) -> Res
         if shown.get() != 2 { return Err(errors::new("Ctrl+Shift+Q in Settings did not quit Feather")) }
     }
 
-    println("feather-launcher: stable completion sizing, startup focus, Escape over completion, stable window identity, settings icon, Settings Escape and X, shortcut rebinding, and Ctrl+Shift+Q passed; no process started")
+    println("feather-launcher: stable completion sizing, startup focus, Escape over completion, command lines, stable window identity, settings icon, Settings Escape and X, shortcut rebinding, and Ctrl+Shift+Q passed; no process started")
     Ok(())
 }
 

@@ -1,6 +1,6 @@
 [project]
 id = "dev.gossamer/feather-launcher"
-version = "0.1.1"
+version = "0.2.0"
 gossamer-version = "^v0.75.17"
 entry = "src/main.gos"
 

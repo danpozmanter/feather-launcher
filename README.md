@@ -30,8 +30,10 @@ start Feather or enable autostart.
 | Ctrl+Shift+Q | Quit Feather |
 
 - Fuzzy search keeps character order (`ml` matches Mail, `li` does not) and
-  covers names, generic names, and keywords. Nothing is sent to a shell, and
-  launches are not remembered.
+  covers names, generic names, and keywords. Launches are not remembered.
+- A command line runs a program from `PATH` with its arguments:
+  `waftty --drop-down`. Words split like a shell's, with quotes, backslashes,
+  and `~`, but nothing is sent to a shell: no variables, globs, or pipes.
 - The catalog and icons rebuild in the background whenever a desktop entry
   under the XDG application folders changes.
 - One instance runs per user; starting it again shows the existing one.

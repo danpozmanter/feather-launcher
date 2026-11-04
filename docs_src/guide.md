@@ -23,6 +23,23 @@ not. Names, generic names such as "Web Browser", and keywords all match.
 When you add, remove, or edit an application, Feather picks up the change the
 next time the box opens.
 
+## Running commands
+
+Type a command line to run a program directly, arguments included:
+`waftty --drop-down`. Feather looks the program up on `PATH` (an absolute
+path or `~/...` also works) and proposes the command line above every
+application; ++enter++ runs it.
+
+A single word with no arguments is an application name first: `firefox`
+starts the Firefox entry, and the program of that name is offered last in
+the list. When no application matches, ++enter++ runs the program.
+
+The text is split into words the way a shell splits them: single quotes keep
+text as typed, double quotes group words (a backslash escapes `"`, `\`, `$`,
+and `` ` `` inside them), a backslash keeps the next character, and a leading
+`~` is your home folder. Nothing else a shell does happens: no variables,
+globs, pipes, or redirection. Run `sh -c '...'` when you want those.
+
 ## Settings
 
 Click the gear to the left of the entry box. **Change...** records a new

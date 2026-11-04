@@ -10,6 +10,8 @@ use gui::widgets::cx::TaskOutcome
 use gui::widgets::display
 use gui::text::layout::TextAlign
 use gui::widgets::textinput::{InputKind, TextInput}
+use command
+use command::Invocation
 use hotkey
 use search
 
@@ -19,7 +21,7 @@ pub const ICON_SVG: String = comptime { fs::read_to_string("assets/feather-launc
 /// Feather's accent: the selected result, buttons, and focused fields.
 pub const BRONZE: gui::Color = gui::Color::hex(0xB05E24)
 const FOCUS: gui::Color = gui::Color::hex(0x5C3112)
-pub const APP_VERSION: String = "0.1.1"
+pub const APP_VERSION: String = "0.2.0"
 
 // Default global launch shortcut and window-local quit shortcut.
 pub const DEFAULT_LAUNCH_KEY: String = "Ctrl+Space"
@@ -38,6 +40,8 @@ pub struct Model {
     apps: Vec<AppEntry>
     loading: bool
     query: String
+    /// The command `query` names, if its program exists.
+    command: Option<Invocation>
     /// A completion request that arrived before the catalog: (id, query).
     waiting: Option<(i64, String)>
     /// Text submitted before the catalog arrived, launched once it does.
@@ -47,6 +51,8 @@ pub struct Model {
     error: String
     fixture: bool
     launches: Vec<String>
+    /// The argument lists of the commands a fixture run started.
+    commands: Vec<Vec<String>>
     /// Whether the run box is meant to be on screen. The driver loop raises
     /// or hides the native window whenever this flips.
     pub shown: bool
@@ -83,7 +89,7 @@ pub fn init(fixture: bool) -> Model {
     Model {
         apps: if fixture { fixture_catalog() } else { #[] }
         loading: !fixture
-        query: "", waiting: None, submitted: None, error: "", fixture: fixture, launches: #[]
+        query: "", command: None, waiting: None, submitted: None, error: "", fixture: fixture, launches: #[], commands: #[]
         // The run box opens when the program starts; the hotkey or a launch
         // hides it and the hotkey raises it again.
         shown: true
@@ -96,56 +102,107 @@ pub fn init(fixture: bool) -> Model {
     }
 }
 
-// The proposals for `query`, best first. Recents are not remembered: every
-// search starts from a clean history, so the same text always orders alike.
-fn proposals(m: Model, query: String) -> Vec<CompletionItem> {
-    let found = search::find(m.apps, query, PROPOSALS)
-    let n = found.len()
-    let mut out = #[]
-    for (i, e) in found.iter().enumerate() {
-        let mut item = CompletionItem::new(e.id, e.name).with_detail(e.generic_name)
-        item.image = e.image
-        item.icon = Some(gui::Icon::Grid)
-        // The list sorts by score; descending scores keep the search's order.
-        item.score = (n - i) as f64
-        item.matches = search::highlights(e.name, query)
-        out.push(item)
-    }
-    out
+// What the run box starts for its text.
+enum Target {
+    App(AppEntry)
+    Command(Invocation)
 }
 
-fn launch(m: Model, id: String) -> Model {
-    let chosen = m.apps.filter(|e| e.id == id)
-    if chosen.is_empty() { return m }
-    let e = chosen[0]
+// The best target for `text`, whose command is `typed`. Arguments mark the
+// text as a command line; a bare word is an application name first, and a
+// program only when no application matches it.
+fn target(apps: Vec<AppEntry>, typed: Option<Invocation>, text: String) -> Option<Target> {
+    if let Some(c) = typed && c.has_arguments() { return Some(Target::Command(c)) }
+    if let Some(e) = search::find(apps, text, 1).first() { return Some(Target::App(e)) }
+    typed.map(|c| Target::Command(c))
+}
+
+fn app_item(e: AppEntry, query: String) -> CompletionItem {
+    let mut item = CompletionItem::new(e.id, e.name).with_detail(e.generic_name)
+    item.image = e.image
+    item.icon = Some(gui::Icon::Grid)
+    item.matches = search::highlights(e.name, query)
+    item
+}
+
+fn command_item(c: Invocation) -> CompletionItem {
+    let mut item = CompletionItem::new(command::KEY, c.text).with_detail(c.argv[0])
+    item.icon = Some(gui::Icon::Terminal)
+    item
+}
+
+// The proposals for `query`, best first, in the order `target` picks from.
+// Recents are not remembered: every search starts from a clean history, so
+// the same text always orders alike.
+fn proposals(m: Model, query: String) -> Vec<CompletionItem> {
+    let typed = command::parse(query)
+    let room = if typed.is_some() { PROPOSALS - 1 } else { PROPOSALS }
+    let apps = search::find(m.apps, query, room).map(|e| app_item(e, query))
+    let mut out = #[]
+    if let Some(c) = typed && c.has_arguments() { out.push(command_item(c)) }
+    for item in apps { out.push(item) }
+    if let Some(c) = typed && !c.has_arguments() { out.push(command_item(c)) }
+    let n = out.len()
+    // The list sorts by score; descending scores keep this order.
+    out.iter().enumerate().map(|(i, item)| {
+        let mut scored = item
+        scored.score = (n - i) as f64
+        scored
+    }).collect()
+}
+
+fn start(m: Model, t: Target) -> Model {
     let mut n = m
-    if n.fixture {
-        n.launches.push(e.id)
-        n = hide(n)
-    } else {
-        gui::perform(Effect::LaunchApp("launch", e, #[]))
+    match t {
+        Target::App(e) => if n.fixture {
+            n.launches.push(e.id)
+            n = hide(n)
+        } else {
+            gui::perform(Effect::LaunchApp("launch", e, #[]))
+        }
+        Target::Command(c) => if n.fixture {
+            n.commands.push(c.argv)
+            n = hide(n)
+        } else {
+            gui::perform(Effect::LaunchApp("launch", command::entry(c), #[]))
+        }
     }
     n
 }
 
-// Enter without a highlighted proposal starts the best match.
+// A chosen proposal: an application by id, or the typed command.
+fn launch(m: Model, key: String) -> Model {
+    if key == command::KEY {
+        return match m.command {
+            Some(c) => start(m, Target::Command(c))
+            None => m
+        }
+    }
+    match m.apps.iter().find(|e| e.id == key) {
+        Some(e) => start(m, Target::App(e))
+        None => m
+    }
+}
+
+// Enter without a highlighted proposal starts the best target.
 fn submit(m: Model, text: String) -> Model {
     if m.loading {
         let mut n = m
         n.submitted = Some(text)
         return n
     }
-    let best = search::find(m.apps, text, 1)
-    if best.is_empty() {
-        let mut n = m
-        n.error = if text.trim().is_empty() { "" } else { f"No application matches \u{201c}{text.trim()}\u{201d}" }
-        return n
+    match target(m.apps, command::parse(text), text) {
+        Some(t) => start(m, t)
+        None => {
+            let mut n = m
+            n.error = if text.trim().is_empty() { "" } else { f"No application or command matches \u{201c}{text.trim()}\u{201d}" }
+            n
+        }
     }
-    launch(m, best[0].id)
 }
 
 fn show(mut m: Model) -> Model {
-    if !m.shown { m.query = ""; m.error = "" }
+    if !m.shown { m.query = ""; m.command = None; m.error = "" }
     m.shown = true
     m
 }
@@ -194,6 +251,7 @@ pub fn update(m: Model, msg: UiMsg) -> Model {
         }
         UiMsg::Text(id, text) => if id == "run" {
             n.query = text
+            n.command = command::parse(text)
             n.error = ""
             n.submitted = None
         }
@@ -304,16 +362,17 @@ fn styled(widget: Widget) -> Widget {
 fn run_input(m: Model) -> TextInput {
     let mut c = Completion::asynchronous(0)
     c.limit = PROPOSALS
-    let mut field = TextInput::new("run", m.query, "Start typing...", InputKind::Line)
+    let mut field = TextInput::new("run", m.query, "Application or command...", InputKind::Line)
     field.completion = Some(c)
     field.error = m.error
     field.leading_icon = Some(gui::Icon::Search)
-    if !m.query.trim().is_empty() {
-        let best = search::find(m.apps, m.query, 1)
-        if !best.is_empty() {
-            field.leading_image = best[0].image
+    match target(m.apps, m.command, m.query) {
+        Some(Target::App(e)) => {
+            field.leading_image = e.image
             field.leading_icon = Some(gui::Icon::Grid)
         }
+        Some(Target::Command(_)) => field.leading_icon = Some(gui::Icon::Terminal)
+        None => ()
     }
     field
 }
@@ -552,9 +611,53 @@ mod tests {
         let mut m = fixture()
         m = super::update(m, UiMsg::Submit("run", "zzz"))
         assert(m.launches.is_empty())
-        assert_eq(m.error, "No application matches \u{201c}zzz\u{201d}")
+        assert_eq(m.error, "No application or command matches \u{201c}zzz\u{201d}")
         m = super::update(m, UiMsg::Text("run", "zz"))
         assert_eq(m.error, "")
+    }
+
+    #[test]
+    fn a_command_with_arguments_is_proposed_first_and_enter_runs_it() {
+        let m = fixture()
+        let sh = super::command::parse("sh").unwrap().argv[0]
+        let items = super::proposals(m, "sh -c 'exit 0'")
+        assert_eq(items[0].key, super::command::KEY)
+        assert_eq(items[0].label, "sh -c 'exit 0'")
+        assert_eq(items[0].detail, sh)
+        let typed = super::update(m, UiMsg::Text("run", "sh -c 'exit 0'"))
+        assert_eq(super::run_input(typed).leading_icon, Some(super::gui::Icon::Terminal))
+        let ran = super::update(typed, UiMsg::Submit("run", "sh -c 'exit 0'"))
+        assert_eq(ran.commands, #[#[sh, "-c", "exit 0"]])
+        assert(ran.launches.is_empty())
+        assert(!ran.shown)
+    }
+
+    #[test]
+    fn a_bare_word_prefers_an_application_and_offers_its_program_last() {
+        let mut m = fixture()
+        let sh = super::command::parse("sh").unwrap().argv[0]
+        m.apps.push(super::fixture_entry("shell", "Shell", "sh"))
+        assert_eq(super::proposals(m, "sh").map(|i| i.key), #["shell", super::command::KEY])
+        let launched = super::update(m, UiMsg::Submit("run", "sh"))
+        assert_eq(launched.launches, #["shell"])
+        assert(launched.commands.is_empty())
+        // Choosing the command proposal runs the program instead.
+        let typed = super::update(m, UiMsg::Text("run", "sh"))
+        let chosen = super::update(typed, UiMsg::Select("run", super::command::KEY))
+        assert_eq(chosen.commands, #[#[sh]])
+        assert(chosen.launches.is_empty())
+    }
+
+    #[test]
+    fn text_naming_no_program_proposes_no_command() {
+        let m = fixture()
+        assert(!super::proposals(m, "term").iter().any(|i| i.key == super::command::KEY))
+        assert(!super::proposals(m, "feather-no-such-program --flag").iter().any(|i| i.key == super::command::KEY))
+        let m = super::update(m, UiMsg::Submit("run", "feather-no-such-program --flag"))
+        assert(m.commands.is_empty())
+        assert_eq(m.error, "No application or command matches \u{201c}feather-no-such-program --flag\u{201d}")
+        let m = super::update(m, UiMsg::Select("run", super::command::KEY))
+        assert(m.commands.is_empty())
     }
 
     #[test]

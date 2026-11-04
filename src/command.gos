@@ -1,0 +1,179 @@
+// Raw commands typed into the run box. The text is split into words the way a
+// shell splits them, but nothing else a shell does happens: no variables,
+// globs, pipes, or redirection. The program runs directly, never via `sh`.
+use std::{env, fs, path}
+use gui::services::apps::AppEntry
+
+/// The proposal key of the typed command. Catalog ids are desktop file names,
+/// which end in `.desktop`, so this key never names an application.
+pub const KEY: String = "feather:command"
+
+const EXECUTABLE_BITS: i64 = 0o111
+
+/// A typed command line whose program exists and may be executed.
+#[derive(Debug, PartialEq)]
+pub struct Invocation {
+    /// The text as typed, without surrounding whitespace.
+    pub text: String
+    /// The program's resolved path, then the arguments as typed.
+    pub argv: Vec<String>
+}
+
+impl Invocation {
+    /// Whether arguments follow the program, which marks the text as a command
+    /// line rather than an application name.
+    pub fn has_arguments(&self) -> bool {
+        self.argv.len() > 1
+    }
+}
+
+/// The words of `text`: whitespace separates them, single quotes keep text
+/// literally, double quotes group text in which a backslash escapes `"`, `\`,
+/// `$`, and `` ` ``, and a bare backslash keeps the next character. A word
+/// starting with an unquoted `~` or `~/` begins in `home`. None when a quote
+/// or a trailing backslash is left open.
+pub fn words(text: String, home: String) -> Option<Vec<String>> {
+    let mut out = #[]
+    let mut word = String::new()
+    let mut started = false
+    let mut tilde = false
+    let mut single = false
+    let mut double = false
+    let mut escaped = false
+    for c in text {
+        if escaped {
+            if double && c != '"' && c != '\\' && c != '$' && c != '`' { word.push('\\') }
+            word.push(c)
+            escaped = false
+        } else if single {
+            if c == '\'' { single = false } else { word.push(c) }
+        } else if double {
+            if c == '"' { double = false } else if c == '\\' { escaped = true } else { word.push(c) }
+        } else if c == ' ' || c == '\t' || c == '\n' {
+            if started { out.push(expand(word, tilde, home)) }
+            word = String::new()
+            started = false
+            tilde = false
+        } else {
+            if !started && c == '~' { tilde = true }
+            started = true
+            match c {
+                '\'' => single = true
+                '"' => double = true
+                '\\' => escaped = true
+                _ => word.push(c)
+            }
+        }
+    }
+    if single || double || escaped { return None }
+    if started { out.push(expand(word, tilde, home)) }
+    Some(out)
+}
+
+// `~` alone or as `~/...` names the home folder; `~user` is left as typed.
+fn expand(word: String, tilde: bool, home: String) -> String {
+    if !tilde || home.is_empty() { return word }
+    if word == "~" { return home }
+    if word.starts_with("~/") { return path::join(home, word.substring(2, word.byte_len())) }
+    word
+}
+
+fn executable(file: String) -> bool {
+    fs::is_file(file) && fs::permissions(file).map(|bits| bits & EXECUTABLE_BITS != 0).unwrap_or(false)
+}
+
+/// Where `program` runs from: itself when it holds a `/` (an absolute path
+/// only, since Feather's working folder is arbitrary), else the first
+/// executable of that name in `search`, PATH's folders in order.
+pub fn resolve(program: String, search: Vec<String>) -> Option<String> {
+    if program.contains("/") {
+        return if path::is_absolute(program) && executable(program) { Some(program) } else { None }
+    }
+    search.iter().filter(|dir| !dir.is_empty()).map(|dir| path::join(dir, program)).find(executable)
+}
+
+/// The command `text` names, searched for in `search` with `~` meaning
+/// `home`, or None when it is empty, malformed, or names no program.
+pub fn parse_in(text: String, search: Vec<String>, home: String) -> Option<Invocation> {
+    let mut argv = words(text, home)?
+    let program = argv.first()?
+    argv[0] = resolve(program, search)?
+    Some(Invocation { text: text.trim(), argv: argv })
+}
+
+/// The command `text` names, searched for on this process's PATH.
+pub fn parse(text: String) -> Option<Invocation> {
+    let search = env::var("PATH").unwrap_or("").split(":")
+    parse_in(text, search, env::var("HOME").unwrap_or(""))
+}
+
+/// `command` as a catalog entry, for the launch effect that starts entries.
+/// A `%` is doubled because the effect reads `Exec` field codes, so every
+/// argument reaches the program exactly as typed.
+pub fn entry(command: Invocation) -> AppEntry {
+    AppEntry {
+        id: KEY, name: command.text, generic_name: String::new(), comment: String::new(), icon: String::new()
+        keywords: #[], categories: #[], exec: command.argv.map(|arg| arg.replace("%", "%%")), terminal: false
+        source: String::new(), image: None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path}
+    use gui::services::apps
+
+    fn no_words() -> Vec<String> { #[] }
+
+    #[test]
+    fn words_split_on_whitespace_and_honor_quotes_and_escapes() {
+        assert_eq(super::words("waftty  --drop-down", "/h"), Some(#["waftty", "--drop-down"]))
+        assert_eq(super::words("  ", "/h"), Some(no_words()))
+        assert_eq(super::words("echo 'a  b' \"c \\\"d\\\" \\n\" e\\ f", "/h"), Some(#["echo", "a  b", "c \"d\" \\n", "e f"]))
+        assert_eq(super::words("echo '' \"\"", "/h"), Some(#["echo", "", ""]))
+        assert_eq(super::words("echo $HOME *.txt a|b", "/h"), Some(#["echo", "$HOME", "*.txt", "a|b"]))
+    }
+
+    #[test]
+    fn words_reject_open_quotes_and_trailing_backslashes() {
+        assert_eq(super::words("echo 'open", "/h"), None)
+        assert_eq(super::words("echo \"open", "/h"), None)
+        assert_eq(super::words("echo open\\", "/h"), None)
+    }
+
+    #[test]
+    fn only_a_bare_leading_tilde_names_home() {
+        assert_eq(super::words("ls ~ ~/docs '~/x' a~/b ~user", "/h"), Some(#["ls", "/h", "/h/docs", "~/x", "a~/b", "~user"]))
+    }
+
+    #[test]
+    fn programs_resolve_on_the_search_path_or_as_absolute_executables() {
+        let dir = fs::temp_dir("feather-command-").unwrap()
+        let tool = path::join(dir, "feather-tool")
+        fs::write_mode(tool, "#!/bin/sh\n".bytes(), 0o755).unwrap()
+        let plain = path::join(dir, "feather-data")
+        fs::write_mode(plain, "data\n".bytes(), 0o644).unwrap()
+        let search = #["", "/nonexistent", dir]
+        assert_eq(super::resolve("feather-tool", search), Some(tool))
+        assert_eq(super::resolve(tool, no_words()), Some(tool))
+        assert_eq(super::resolve("feather-data", search), None)
+        assert_eq(super::resolve("feather-missing", search), None)
+        assert_eq(super::resolve("./feather-tool", search), None)
+        let found = super::parse_in(" feather-tool --drop-down  ", search, "/h").unwrap()
+        assert_eq(found.text, "feather-tool --drop-down")
+        assert_eq(found.argv, #[tool, "--drop-down"])
+        assert(found.has_arguments())
+        assert(!super::parse_in("feather-tool", search, "/h").unwrap().has_arguments())
+        assert_eq(super::parse_in("feather-tool 'open", search, "/h"), None)
+        assert_eq(super::parse_in("", search, "/h"), None)
+        fs::remove_dir_all(dir).unwrap()
+    }
+
+    #[test]
+    fn launch_entries_pass_percent_signs_through_unchanged() {
+        let command = super::Invocation { text: "date +%H %f", argv: #["/bin/date", "+%H", "%f", "100%%"] }
+        let entry = super::entry(command)
+        assert_eq(entry.id, super::KEY)
+        assert_eq(apps::command_for(entry, #["/ignored"]), #["/bin/date", "+%H", "%f", "100%%"])
+    }
+}
