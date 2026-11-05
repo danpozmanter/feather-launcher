@@ -18,8 +18,14 @@ hidden, detached from the terminal.
 
 ## Searching
 
-Matching keeps the order of the letters you type: `ml` finds Mail, `li` does
-not. Names, generic names such as "Web Browser", and keywords all match.
+What you type must appear whole, in one piece, somewhere in an application's
+name; case does not matter. `rite` and `WRI` find LibreOffice Writer, but
+`lit` does not, because those letters are not next to each other in the name.
+Names that start with the text come first, then names with a word that starts
+with it, then names that hold it elsewhere. Generic names such as "Web
+Browser" and keywords match too.
+
+The best match is selected as you type, so ++enter++ starts it.
 When you add, remove, or edit an application, Feather picks up the change the
 next time the box opens.
 

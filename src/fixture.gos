@@ -102,7 +102,7 @@ pub fn run(mut s: gui::Session, shown: Shared<i64>, rx: Receiver<String>) -> Res
     // global hotkey at once (the watcher picks it up between events).
     if !s.click("app.settings")? { return Err(errors::new("The settings icon is missing")) }
     s.flush()?
-    s.emit(UiMsg::Click("settings.launch"))
+    s.emit(UiMsg::Clicked("settings.launch"))
     s.flush()?
     expect_binding(rx, Some(hotkey::CAPTURE_PAUSE))?
     if s.window_count() != 3 { return Err(errors::new("The shortcut dialog did not get its own window")) }
@@ -181,16 +181,16 @@ fn appearance(mut s: gui::Session, rx: Receiver<String>) -> Result<(), errors::E
     }
     let Some(field) = s.rect_of("run") else { return Err(errors::new("The run box is missing")) }
     let window = s.window_pixel_size(0)
-    s.emit(UiMsg::Value("settings.font-size", settings::FONT_SIZE_MAX))
-    s.emit(UiMsg::Select("settings.font", "Feather Fixture Missing Family"))
-    s.emit(UiMsg::Choose("settings.theme", "dark"))
-    s.emit(UiMsg::Toggle("settings.icons", false))
+    s.emit(UiMsg::ValueChanged("settings.font-size", settings::FONT_SIZE_MAX))
+    s.emit(UiMsg::Selected("settings.font", "Feather Fixture Missing Family"))
+    s.emit(UiMsg::Chosen("settings.theme", "dark"))
+    s.emit(UiMsg::Toggled("settings.icons", false))
     s.flush()?
     s.advance(1)?
     let Some(large) = s.rect_of("run") else { return Err(errors::new("The run box is missing")) }
     if large.height <= field.height { return Err(errors::new(f"A larger font did not grow the run box: {field} became {large}")) }
     if s.window_pixel_size(0).1 < large.y + large.height { return Err(errors::new(f"The launcher did not grow to hold a larger run box: {s.window_pixel_size(0)} for {large}")) }
-    s.emit(UiMsg::Click("settings.reset"))
+    s.emit(UiMsg::Clicked("settings.reset"))
     s.flush()?
     s.advance(1)?
     expect_binding(rx, None)?

@@ -1,5 +1,6 @@
-// Names use ordered fuzzy matching. Metadata supplies deliberate aliases,
-// rather than arbitrary substrings hidden in comments or generic names.
+// The text must appear whole in a name, ignoring case; names it begins rank
+// first, then names with a word it begins. Metadata supplies deliberate
+// aliases, rather than arbitrary substrings hidden in comments.
 use std::unicode
 use gui::services::apps::AppEntry
 use gui::widgets::completion::{match_label, MatchMode}
@@ -8,32 +9,72 @@ fn compact(text: String) -> String {
     unicode::fold_case(text).split_whitespace().join("")
 }
 
+fn spaced(text: String) -> String {
+    text.split_whitespace().join(" ")
+}
+
 fn alias_matches(alias: String, query: String) -> bool {
     let mut words = #[compact(alias)]
     for word in alias.split_whitespace() { words.push(compact(word)) }
     words.iter().any(|word| word == query || (query.len() >= 3 && word.starts_with(query)))
 }
 
-fn score(entry: AppEntry, query: String) -> f64 {
-    let fuzzy, ranges = match_label(entry.name, query, MatchMode::Fuzzy)
-    if !ranges.is_empty() {
-        let prefix = match_label(entry.name, query, MatchMode::Prefix).1
-        let substring = match_label(entry.name, query, MatchMode::Substring).1
-        let priority = if !prefix.is_empty() { 1000.0 } else if !substring.is_empty() { 500.0 } else { 100.0 }
-        return priority + fuzzy.max(0.0)
+fn is_word_char(c: char) -> bool {
+    unicode::is_letter(c) || unicode::is_digit(c)
+}
+
+// Byte offsets where a word of `name` begins: after a separator, and at a
+// capital following a lowercase letter, as in `LibreOffice`.
+fn word_starts(name: String) -> Vec<i64> {
+    let mut starts = #[]
+    let mut prev: Option<char> = None
+    let mut offset = 0
+    for c in name {
+        let begins = match prev {
+            None => is_word_char(c)
+            Some(p) => is_word_char(c) && (!is_word_char(p) || (unicode::is_lower(p) && unicode::is_upper(c)))
+        }
+        if begins { starts.push(offset) }
+        offset += c.to_string().byte_len()
+        prev = Some(c)
     }
+    starts
+}
+
+// Where `query` appears whole in `name`, as a byte range, preferring the
+// earliest word it begins; the rank says whether that is the name's start, a
+// later word, or inside a word.
+fn located(name: String, query: String) -> Option<(f64, (i64, i64))> {
+    for start in word_starts(name) {
+        let ranges = match_label(name.substring(start, name.byte_len()), query, MatchMode::Prefix).1
+        if let Some(r) = ranges.first() {
+            let rank = if start == 0 { 1000.0 } else { 500.0 }
+            return Some((rank, (start + r.0, start + r.1)))
+        }
+    }
+    match_label(name, query, MatchMode::Substring).1.first().map(|r| (100.0, r))
+}
+
+fn score(entry: AppEntry, query: String) -> f64 {
+    if let Some(found) = located(entry.name, spaced(query)) { return found.0 }
     let mut aliases = entry.keywords
     aliases.push(entry.generic_name)
-    if aliases.iter().any(|alias| alias_matches(alias, query)) { 1.0 } else { 0.0 }
+    let folded = compact(query)
+    if aliases.iter().any(|alias| alias_matches(alias, folded)) { 1.0 } else { 0.0 }
 }
 
+/// Byte ranges of `label` that `query` matches, for highlighting.
 pub fn highlights(label: String, query: String) -> Vec<(i64, i64)> {
-    match_label(label, compact(query), MatchMode::Fuzzy).1
+    match located(label, spaced(query)) {
+        Some(found) => #[found.1]
+        None => #[]
+    }
 }
 
+/// Up to `limit` entries `query` matches, best first: names it begins, names
+/// with a word it begins, names holding it elsewhere, then aliases.
 pub fn find(entries: Vec<AppEntry>, query: String, limit: i64) -> Vec<AppEntry> {
-    let query = compact(query)
-    if query.is_empty() || limit <= 0 { return #[] }
+    if compact(query).is_empty() || limit <= 0 { return #[] }
     let mut found = #[]
     for entry in entries {
         let rank = score(entry, query)

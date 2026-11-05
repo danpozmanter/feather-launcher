@@ -21,7 +21,7 @@ use settings::Settings
 pub const APP_ID: String = "dev.gossamer.feather-launcher"
 /// Feather's icon, embedded so a build run from anywhere shows it.
 pub const ICON_SVG: String = comptime { fs::read_to_string("assets/feather-launcher.svg").unwrap() }
-pub const APP_VERSION: String = "0.3.0"
+pub const APP_VERSION: String = "0.3.1"
 
 // The Settings window's size in interface units: everything fits without
 // wrapping a description or scrolling. The width is also the smallest the
@@ -257,16 +257,16 @@ pub fn update(m: Model, msg: UiMsg) -> Model {
             n = store(n, Settings { launch_key: text, ..n.settings })
         }
         UiMsg::FontsLoaded(id, records) => if id == "settings" { n.fonts = families(records) }
-        UiMsg::Value(id, size) if id == "settings.font-size" => {
+        UiMsg::ValueChanged(id, size) if id == "settings.font-size" => {
             let points = size.max(settings::FONT_SIZE_MIN).min(settings::FONT_SIZE_MAX)
             n = store(n, Settings { font_size: points, ..n.settings })
         }
-        UiMsg::Choose(id, theme) if id == "settings.theme" => {
+        UiMsg::Chosen(id, theme) if id == "settings.theme" => {
             n = store(n, Settings { theme: theme, ..n.settings })
             gui::perform(settings::theme_effect(n.settings))
         }
-        UiMsg::Toggle(id, on) if id == "settings.icons" => n = store(n, Settings { icons: on, ..n.settings })
-        UiMsg::Select(id, family) if id == "settings.font" => n = store(n, Settings { font: family, ..n.settings })
+        UiMsg::Toggled(id, on) if id == "settings.icons" => n = store(n, Settings { icons: on, ..n.settings })
+        UiMsg::Selected(id, family) if id == "settings.font" => n = store(n, Settings { font: family, ..n.settings })
         UiMsg::Dialog(id, gui::Outcome::Color(c)) if id == "highlight" => n = store(n, Settings { highlight: c.with_alpha(255).css(), ..n.settings })
         UiMsg::CloseRequested(id) => if id == "main" { n = hide(n) }
         else if id == "settings" { gui::perform(Effect::CloseWindow("settings")) }
@@ -275,7 +275,7 @@ pub fn update(m: Model, msg: UiMsg) -> Model {
             n.apps = found
             n.loading = false
             if let Some((request, query)) = n.waiting {
-                gui::perform(Effect::Complete("run", request, proposals(n, query), ""))
+                gui::perform(Effect::AnswerCompletion("run", request, proposals(n, query), ""))
                 n.waiting = None
             }
             if let Some(text) = n.submitted {
@@ -285,19 +285,19 @@ pub fn update(m: Model, msg: UiMsg) -> Model {
         }
         UiMsg::CompletionRequest(id, request, query, _) => if id == "run" {
             if n.loading { n.waiting = Some((request, query)) }
-            else { gui::perform(Effect::Complete("run", request, proposals(n, query), "")) }
+            else { gui::perform(Effect::AnswerCompletion("run", request, proposals(n, query), "")) }
         }
-        UiMsg::Text(id, text) => if id == "run" {
+        UiMsg::TextChanged(id, text) => if id == "run" {
             n.query = text
             n.command = command::parse(text)
             n.error = ""
             n.submitted = None
         }
-        UiMsg::Select(id, key) => if id == "run" { n = launch(n, key) }
-        UiMsg::Submit(id, text) => if id == "run" { n = submit(n, text) }
+        UiMsg::Selected(id, key) => if id == "run" { n = launch(n, key) }
+        UiMsg::Submitted(id, text) => if id == "run" { n = submit(n, text) }
         UiMsg::Command(id) => n = command(n, id)
         UiMsg::WindowCommand(_, id) => n = command(n, id)
-        UiMsg::Click(id) => n = click(n, id)
+        UiMsg::Clicked(id) => n = click(n, id)
         UiMsg::Dialog(id, gui::Outcome::Shortcut(text)) => n = shortcut_changed(n, id, text)
         UiMsg::Task(id, outcome) => if id == "launch" {
             match outcome {
@@ -415,7 +415,7 @@ fn about() -> gui::DialogRequest {
 fn open_settings() {
     gui::perform(Effect::OpenWindow { key: "settings", title: "Feather Settings", width: SETTINGS_WIDTH, height: SETTINGS_HEIGHT })
     gui::perform(Effect::SetMinSize("settings", SETTINGS_WIDTH, SETTINGS_MIN_HEIGHT))
-    gui::perform(Effect::FocusIn("settings", "settings.close"))
+    gui::perform(Effect::FocusInWindow("settings", "settings.close"))
     gui::perform(Effect::LoadFonts("settings"))
 }
 
@@ -634,14 +634,14 @@ mod tests {
     fn hiding_or_editing_cancels_a_submission_waiting_for_the_catalog() {
         let mut m = fixture()
         m.loading = true
-        m = super::update(m, UiMsg::Submit("run", "term"))
+        m = super::update(m, UiMsg::Submitted("run", "term"))
         assert_eq(m.submitted, Some("term"))
         m = super::update(m, UiMsg::Custom("hotkey", ""))
         m = super::update(m, UiMsg::AppsLoaded("catalog", super::fixture_catalog()))
         assert(m.launches.is_empty())
         m.loading = true
-        m = super::update(m, UiMsg::Submit("run", "term"))
-        m = super::update(m, UiMsg::Text("run", "edit"))
+        m = super::update(m, UiMsg::Submitted("run", "term"))
+        m = super::update(m, UiMsg::TextChanged("run", "edit"))
         m = super::update(m, UiMsg::AppsLoaded("catalog", super::fixture_catalog()))
         assert(m.launches.is_empty())
     }
@@ -649,7 +649,7 @@ mod tests {
     #[test]
     fn a_fixture_launch_hides_and_enter_starts_the_best_match() {
         let m = fixture()
-        let m = super::update(m, UiMsg::Submit("run", "edit"))
+        let m = super::update(m, UiMsg::Submitted("run", "edit"))
         assert_eq(m.launches, #["editor"])
         assert(!m.shown)
     }
@@ -659,13 +659,13 @@ mod tests {
         let mut m = fixture()
         m.fixture = false
         // The launch is on its way; the box stays until the answer.
-        m = super::update(m, UiMsg::Submit("run", "term"))
+        m = super::update(m, UiMsg::Submitted("run", "term"))
         assert(m.shown)
         m = super::update(m, UiMsg::Task("launch", super::TaskOutcome::Done("")))
         assert(!m.shown)
         // A failure keeps the box up to show why.
         m = super::update(m, UiMsg::Custom("hotkey", ""))
-        m = super::update(m, UiMsg::Submit("run", "term"))
+        m = super::update(m, UiMsg::Submitted("run", "term"))
         m = super::update(m, UiMsg::Task("launch", super::TaskOutcome::Failed("no such file")))
         assert(m.shown)
         assert_eq(m.error, "Could not start it: no such file")
@@ -677,12 +677,12 @@ mod tests {
         let items = super::proposals(m, "term")
         assert_eq(items[0].image, m.apps[2].image)
         assert(items[0].image.is_some())
-        m = super::update(m, UiMsg::Text("run", "term"))
+        m = super::update(m, UiMsg::TextChanged("run", "term"))
         assert_eq(super::run_input(m).leading_image, items[0].image)
         m.apps[2].image = None
         assert(super::run_input(m).leading_image.is_none())
         assert_eq(super::proposals(m, "term")[0].icon, Some(super::gui::Icon::Grid))
-        m = super::update(m, UiMsg::Text("run", ""))
+        m = super::update(m, UiMsg::TextChanged("run", ""))
         assert_eq(super::run_input(m).leading_icon, Some(super::gui::Icon::Search))
         assert(super::run_input(m).leading_image.is_none())
     }
@@ -695,12 +695,12 @@ mod tests {
         // Names starting with the text, then a word starting with it, then containing it.
         assert_eq(super::proposals(m, "t").map(|i| i.key), #["terminal", "editor", "calculator"])
         // A launch is not remembered: the order a fresh search gives stays put.
-        let m = super::update(m, UiMsg::Select("run", "editor"))
+        let m = super::update(m, UiMsg::Selected("run", "editor"))
         assert_eq(super::proposals(m, "t").map(|i| i.key), #["terminal", "editor", "calculator"])
     }
 
     #[test]
-    fn fuzzy_search_preserves_order_and_ignores_hidden_substrings() {
+    fn search_matches_the_whole_text_anywhere_in_a_name_ignoring_case() {
         let mut m = fixture()
         let mut mail = super::fixture_entry("mail", "Mail", "mail")
         mail.generic_name = "Mail Client"
@@ -708,24 +708,31 @@ mod tests {
         mail.keywords = #["Linux", "Email"]
         m.apps.push(mail)
         m.apps.push(super::fixture_entry("libre", "LibreOffice", "libreoffice"))
-        assert_eq(super::proposals(m, "li").map(|item| item.key), #["libre"])
-        assert(super::proposals(m, "ml").iter().any(|item| item.key == "mail"))
+        m.apps.push(super::fixture_entry("writer", "LibreOffice Writer", "lowriter"))
+        assert_eq(super::proposals(m, "li").map(|item| item.key), #["libre", "writer"])
+        assert(super::proposals(m, "ml").is_empty())
+        assert(super::proposals(m, "lit").is_empty())
         assert(super::proposals(m, "lll").is_empty())
-        let launched = super::update(m, UiMsg::Submit("run", "li"))
+        assert_eq(super::proposals(m, "WRI").map(|item| item.key), #["writer"])
+        assert_eq(super::proposals(m, "ffICE").map(|item| item.key), #["libre", "writer"])
+        assert_eq(super::search::find(m.apps, "office  w", 5).map(|e| e.id), #["writer"])
+        assert_eq(super::proposals(m, "wri")[0].matches, #[(12, 15)])
+        assert_eq(super::proposals(m, "rite")[0].matches, #[(13, 17)])
+        let launched = super::update(m, UiMsg::Submitted("run", "li"))
         assert_eq(launched.launches, #["libre"])
-        let no_match = super::update(m, UiMsg::Submit("run", "zzqq"))
+        let no_match = super::update(m, UiMsg::Submitted("run", "zzqq"))
         assert(no_match.launches.is_empty())
-        let input = super::run_input(super::update(m, UiMsg::Text("run", "li")))
+        let input = super::run_input(super::update(m, UiMsg::TextChanged("run", "li")))
         assert_eq(input.leading_image, m.apps[4].image)
     }
 
     #[test]
     fn enter_on_text_nothing_matches_explains_until_the_text_changes() {
         let mut m = fixture()
-        m = super::update(m, UiMsg::Submit("run", "zzz"))
+        m = super::update(m, UiMsg::Submitted("run", "zzz"))
         assert(m.launches.is_empty())
         assert_eq(m.error, "No application or command matches \u{201c}zzz\u{201d}")
-        m = super::update(m, UiMsg::Text("run", "zz"))
+        m = super::update(m, UiMsg::TextChanged("run", "zz"))
         assert_eq(m.error, "")
     }
 
@@ -737,9 +744,9 @@ mod tests {
         assert_eq(items[0].key, super::command::KEY)
         assert_eq(items[0].label, "sh -c 'exit 0'")
         assert_eq(items[0].detail, sh)
-        let typed = super::update(m, UiMsg::Text("run", "sh -c 'exit 0'"))
+        let typed = super::update(m, UiMsg::TextChanged("run", "sh -c 'exit 0'"))
         assert_eq(super::run_input(typed).leading_icon, Some(super::gui::Icon::Terminal))
-        let ran = super::update(typed, UiMsg::Submit("run", "sh -c 'exit 0'"))
+        let ran = super::update(typed, UiMsg::Submitted("run", "sh -c 'exit 0'"))
         assert_eq(ran.commands, #[#[sh, "-c", "exit 0"]])
         assert(ran.launches.is_empty())
         assert(!ran.shown)
@@ -751,12 +758,12 @@ mod tests {
         let sh = super::command::parse("sh").unwrap().argv[0]
         m.apps.push(super::fixture_entry("shell", "Shell", "sh"))
         assert_eq(super::proposals(m, "sh").map(|i| i.key), #["shell", super::command::KEY])
-        let launched = super::update(m, UiMsg::Submit("run", "sh"))
+        let launched = super::update(m, UiMsg::Submitted("run", "sh"))
         assert_eq(launched.launches, #["shell"])
         assert(launched.commands.is_empty())
         // Choosing the command proposal runs the program instead.
-        let typed = super::update(m, UiMsg::Text("run", "sh"))
-        let chosen = super::update(typed, UiMsg::Select("run", super::command::KEY))
+        let typed = super::update(m, UiMsg::TextChanged("run", "sh"))
+        let chosen = super::update(typed, UiMsg::Selected("run", super::command::KEY))
         assert_eq(chosen.commands, #[#[sh]])
         assert(chosen.launches.is_empty())
     }
@@ -766,10 +773,10 @@ mod tests {
         let m = fixture()
         assert(!super::proposals(m, "term").iter().any(|i| i.key == super::command::KEY))
         assert(!super::proposals(m, "feather-no-such-program --flag").iter().any(|i| i.key == super::command::KEY))
-        let m = super::update(m, UiMsg::Submit("run", "feather-no-such-program --flag"))
+        let m = super::update(m, UiMsg::Submitted("run", "feather-no-such-program --flag"))
         assert(m.commands.is_empty())
         assert_eq(m.error, "No application or command matches \u{201c}feather-no-such-program --flag\u{201d}")
-        let m = super::update(m, UiMsg::Select("run", super::command::KEY))
+        let m = super::update(m, UiMsg::Selected("run", super::command::KEY))
         assert(m.commands.is_empty())
     }
 
@@ -786,13 +793,13 @@ mod tests {
     #[test]
     fn settings_offers_no_quit_button_and_about_keeps_feather_running() {
         let mut m = fixture()
-        m = super::update(m, UiMsg::Click("app.settings"))
-        m = super::update(m, UiMsg::Click("settings.about"))
+        m = super::update(m, UiMsg::Clicked("app.settings"))
+        m = super::update(m, UiMsg::Clicked("settings.about"))
         assert(!m.quit)
         assert(m.shown)
         let shown = format("{}", super::settings_view(m))
         assert(shown.contains("settings.about") && !shown.contains("quit-app"))
-        m = super::update(m, UiMsg::Click("settings.quit-app"))
+        m = super::update(m, UiMsg::Clicked("settings.quit-app"))
         assert(!m.quit)
     }
 
@@ -816,13 +823,13 @@ mod tests {
     #[test]
     fn shortcut_recording_suspends_the_grab_and_cancel_preserves_the_binding() {
         let mut m = fixture()
-        m = super::update(m, UiMsg::Click("settings.launch"))
+        m = super::update(m, UiMsg::Clicked("settings.launch"))
         assert(m.capturing_shortcut)
         assert_eq(m.launch_key, "Ctrl+Space")
         m = super::update(m, UiMsg::Dialog("shortcut.launch", super::gui::Outcome::Cancelled))
         assert(!m.capturing_shortcut)
         assert_eq(m.launch_key, "Ctrl+Space")
-        m = super::update(m, UiMsg::Click("settings.launch"))
+        m = super::update(m, UiMsg::Clicked("settings.launch"))
         m = super::update(m, UiMsg::Dialog("shortcut.launch", super::gui::Outcome::Shortcut("Ctrl+Home")))
         assert(!m.capturing_shortcut)
         assert_eq(m.launch_key, "Ctrl+Home")
@@ -866,9 +873,9 @@ mod tests {
     #[test]
     fn appearance_settings_reach_the_model_and_the_run_box() {
         let mut m = fixture()
-        m = super::update(m, UiMsg::Select("settings.font", "DejaVu Serif"))
-        m = super::update(m, UiMsg::Value("settings.font-size", 99.0))
-        m = super::update(m, UiMsg::Choose("settings.theme", "dark"))
+        m = super::update(m, UiMsg::Selected("settings.font", "DejaVu Serif"))
+        m = super::update(m, UiMsg::ValueChanged("settings.font-size", 99.0))
+        m = super::update(m, UiMsg::Chosen("settings.theme", "dark"))
         m = super::update(m, UiMsg::Dialog("highlight", super::gui::Outcome::Color(super::gui::Color::hex(0x3366CC))))
         assert_eq(m.settings.font, "DejaVu Serif")
         assert_eq(m.settings.font_size, super::settings::FONT_SIZE_MAX)
@@ -881,8 +888,8 @@ mod tests {
     #[test]
     fn icons_off_leave_results_and_the_run_box_bare() {
         let mut m = fixture()
-        m = super::update(m, UiMsg::Toggle("settings.icons", false))
-        m = super::update(m, UiMsg::Text("run", "term"))
+        m = super::update(m, UiMsg::Toggled("settings.icons", false))
+        m = super::update(m, UiMsg::TextChanged("run", "term"))
         let items = super::proposals(m, "term")
         assert(items[0].image.is_none())
         assert(items[0].icon.is_none())
@@ -896,10 +903,10 @@ mod tests {
         let mut m = fixture()
         m = super::update(m, UiMsg::Dialog("shortcut.launch", super::gui::Outcome::Shortcut("Ctrl+Alt+L")))
         m = super::update(m, UiMsg::Dialog("shortcut.quit", super::gui::Outcome::Shortcut("")))
-        m = super::update(m, UiMsg::Toggle("settings.icons", false))
-        m = super::update(m, UiMsg::Choose("settings.theme", "light"))
+        m = super::update(m, UiMsg::Toggled("settings.icons", false))
+        m = super::update(m, UiMsg::Chosen("settings.theme", "light"))
         assert(m.settings != super::settings::defaults())
-        m = super::update(m, UiMsg::Click("settings.reset"))
+        m = super::update(m, UiMsg::Clicked("settings.reset"))
         assert_eq(m.settings, super::settings::defaults())
         assert_eq(m.launch_key, super::settings::DEFAULT_LAUNCH_KEY)
         assert_eq(super::launch_reserved(m), #["Ctrl+Esc", "Ctrl+Shift+Q"])

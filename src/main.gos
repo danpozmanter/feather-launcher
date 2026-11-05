@@ -95,7 +95,7 @@ fn run_session(mut s: gui::Session, owner: Option<i32>) -> Result<(), errors::Er
         |window: String| app::view(cell[0], window)
         |_window: String| app::commands(cell[0])
     )
-    s.emit(UiMsg::Text("run", ""))
+    s.emit(UiMsg::TextChanged("run", ""))
     s.flush()?
     if is_fixture { return fixture::run(s, shown, rx) }
     daemon::ready()?

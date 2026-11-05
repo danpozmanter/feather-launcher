@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1 - whole-text search and best-match selection
+
+- Search matches what you type whole, anywhere in a name and ignoring case,
+  instead of letters scattered through it: `rite` finds LibreOffice Writer and
+  `lit` does not. Names starting with the text come first, then names with a
+  word starting with it.
+- The best match is selected as you type, instead of a result picked during
+  an earlier search staying selected further down the list.
+
 ## 0.3.0 - appearance settings
 
 - Settings chooses the run box's font and font size, the theme (system, light
