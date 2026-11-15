@@ -11,6 +11,9 @@ permissions:
 
 env:
   GOSSAMER_REPO: gossamer-lang/gossamer
+  # The release install.sh downloads this tag directly, without asking the
+  # rate-limited GitHub API for the latest one.
+  GOSSAMER_VERSION: v0.79.2
   # Every check here runs without a real display.
   SDL_VIDEO_DRIVER: offscreen
   # Settings and caches of the runs stay out of the runner's home.
