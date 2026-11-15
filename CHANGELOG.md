@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2 - Better text drawing
+
+- Color emoji, variable fonts and every script draw correctly.
+- Old font cache files are cleaned up.
+- Builds on gui-gos 0.2.12 and Gossamer 0.79.2.
+
 ## 0.3.1 - whole-text search and best-match selection
 
 - Search matches what you type whole, anywhere in a name and ignoring case,

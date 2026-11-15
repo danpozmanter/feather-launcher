@@ -1,8 +1,8 @@
 [project]
 id = "dev.gossamer/feather-launcher"
-version = "0.3.1"
-gossamer-version = "^v0.76.0"
+version = "0.3.2"
+gossamer-version = "^v0.79.2"
 entry = "src/main.gos"
 
 [dependencies]
-"github.com/gossamer-lang/gui-gos" = { git = "https://github.com/gossamer-lang/gui-gos", tag = "v0.2.0" }
+"github.com/gossamer-lang/gui-gos" = { git = "https://github.com/gossamer-lang/gui-gos", tag = "v0.2.12" }
