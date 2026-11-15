@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.3 - No crash right after startup
+
+- Feather no longer crashes when it loads fonts right after the computer starts.
+- Builds on gui-gos 0.3.0.
+
 ## 0.3.2 - Better text drawing
 
 - Color emoji, variable fonts and every script draw correctly.

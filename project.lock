@@ -4,15 +4,15 @@
 id = "github.com/gossamer-lang/gui-engine-gos"
 source = "git"
 url = "https://github.com/gossamer-lang/gui-engine-gos"
-ref = "v0.2.25"
-sha256 = "ad2e54bbbc84a5f2b2cd3c3c05bcf764b077de8a32712b34068c3b8c7a75be35"
+ref = "v0.3.0"
+sha256 = "b0c4e7a07c032b125a637d6f07f6af814e567f17f40950553afb75d517de29ba"
 
 [[project]]
 id = "github.com/gossamer-lang/gui-gos"
 source = "git"
 url = "https://github.com/gossamer-lang/gui-gos"
-ref = "v0.2.12"
-sha256 = "1d43ea2dd297b89b495e58f9c81e94df33772f9ac3eededa71f7db2d797e02ae"
+ref = "v0.3.0"
+sha256 = "f88862b93a6c8258713bd2b0f178ffebbbbe785c97f5202c9ef68fa507487a71"
 
 [[project]]
 id = "github.com/gossamer-lang/windowing-gos"

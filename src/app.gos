@@ -21,7 +21,7 @@ use settings::Settings
 pub const APP_ID: String = "dev.gossamer.feather-launcher"
 /// Feather's icon, embedded so a build run from anywhere shows it.
 pub const ICON_SVG: String = comptime { fs::read_to_string("assets/feather-launcher.svg").unwrap() }
-pub const APP_VERSION: String = "0.3.2"
+pub const APP_VERSION: String = "0.3.3"
 
 // The Settings window's size in interface units: everything fits without
 // wrapping a description or scrolling. The width is also the smallest the
