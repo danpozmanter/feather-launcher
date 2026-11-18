@@ -5,7 +5,7 @@ Feather runs on Linux, on X11 or Wayland, and needs libdbus.
 ## From source
 
 Building Feather needs [Gossamer](https://github.com/gossamer-lang/gossamer)
-0.79.2 or later; `gos build` fetches the GUI libraries pinned in `project.lock`.
+0.81.1 or later; `gos build` fetches the GUI libraries pinned in `project.lock`.
 
 ```sh
 git clone https://github.com/danpozmanter/feather-launcher

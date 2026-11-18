@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.4 - Gossamer 0.81
+
+- Builds on Gossamer 0.81.1 and gui-gos 0.4.0.
+
 ## 0.3.3 - No crash right after startup
 
 - Feather no longer crashes when it loads fonts right after the computer starts.
@@ -9,16 +13,13 @@
 
 - Color emoji, variable fonts and every script draw correctly.
 - Old font cache files are cleaned up.
-- Builds on gui-gos 0.2.12 and Gossamer 0.79.2.
-
-## 0.3.1 - whole-text search and best-match selection
-
 - Search matches what you type whole, anywhere in a name and ignoring case,
   instead of letters scattered through it: `rite` finds LibreOffice Writer and
   `lit` does not. Names starting with the text come first, then names with a
   word starting with it.
 - The best match is selected as you type, instead of a result picked during
   an earlier search staying selected further down the list.
+- Builds on gui-gos 0.2.12 and Gossamer 0.79.2.
 
 ## 0.3.0 - appearance settings
 
@@ -37,10 +38,7 @@
   path, with arguments (`waftty --drop-down`). Quotes and backslashes group
   words; nothing goes through a shell.
 
-## 0.1.1
-
-- Require Gossamer 0.75.17 or later to build.
-
-## 0.1.0
+## 0.1.1 - Initial release
 
 - Initial release.
+- Require Gossamer 0.75.17 or later to build.

@@ -195,9 +195,10 @@ pub fn called(log: String, method: String) -> Vec<String> {
     let mut found = #[]
     for line in text.split("\n") {
         let Ok(entry) = json::parse(line) else { continue }
-        if json::as_str(json::at(entry, 0)) == Some(method) {
-            found.push(json::render(json::at(entry, 1)))
-        }
+        if json::at(entry, 0).and_then(json::as_str) != Some(method) { continue }
+        let Some(arguments) = json::at(entry, 1) else { continue }
+        let Ok(rendered) = json::encode(arguments) else { continue }
+        found.push(rendered)
     }
     found
 }
@@ -206,15 +207,16 @@ pub fn called(log: String, method: String) -> Vec<String> {
 /// document read the same.
 pub fn canonical(text: String) -> String {
     match json::parse(text) {
-        Ok(value) => json::render(value)
+        Ok(value) => json::encode(value).unwrap_or(text)
         Err(_) => text
     }
 }
 
-/// Element `index` of the JSON array `text`, rendered as `canonical` renders.
+/// Element `index` of the JSON array `text`, rendered as `canonical` renders;
+/// empty when there is none.
 pub fn element(text: String, index: i64) -> String {
     match json::parse(text) {
-        Ok(value) => json::render(json::at(value, index))
+        Ok(value) => json::at(value, index).and_then(|v| json::encode(v).ok()).unwrap_or("")
         Err(_) => ""
     }
 }
