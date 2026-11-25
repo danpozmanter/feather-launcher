@@ -12,7 +12,7 @@ id = "github.com/gossamer-lang/gui-gos"
 source = "git"
 url = "https://github.com/gossamer-lang/gui-gos"
 ref = "v0.5.3"
-sha256 = "d85fe066df975479b037ebde6966446b88613b7aa03ae6588510f506580c3798"
+sha256 = "c943f779ec2b45dd6cbb713e9c13fb1b1931578ba8a308309e68edefb281f033"
 
 [[project]]
 id = "github.com/gossamer-lang/windowing-gos"

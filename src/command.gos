@@ -74,8 +74,7 @@ pub fn words(text: String, home: String) -> Option<Vec<String>> {
 fn expand(word: String, tilde: bool, home: String) -> String {
     if !tilde || home.is_empty() { return word }
     if word == "~" { return home }
-    // As in a shell, `~` stands for the home folder's text, so `~/../x` climbs.
-    if word.starts_with("~/") { return home + word.substring(1, word.byte_len()) }
+    if word.starts_with("~/") { return path::join(home, word.substring(2, word.byte_len())) }
     word
 }
 
@@ -90,7 +89,7 @@ pub fn resolve(program: String, search: Vec<String>) -> Option<String> {
     if program.contains("/") {
         return if path::is_absolute(program) && executable(program) { Some(program) } else { None }
     }
-    search.iter().filter(|dir| !dir.is_empty()).filter_map(|dir| path::join(dir, program).ok()).find(executable)
+    search.iter().filter(|dir| !dir.is_empty()).map(|dir| path::join(dir, program)).find(executable)
 }
 
 /// The command `text` names, searched for in `search` with `~` meaning
@@ -150,9 +149,9 @@ mod tests {
     #[test]
     fn programs_resolve_on_the_search_path_or_as_absolute_executables() {
         let dir = fs::temp_dir("feather-command-").unwrap()
-        let tool = path::join(dir, "feather-tool").expect("relative segment")
+        let tool = path::join(dir, "feather-tool")
         fs::write_mode(tool, "#!/bin/sh\n".bytes(), 0o755).unwrap()
-        let plain = path::join(dir, "feather-data").expect("relative segment")
+        let plain = path::join(dir, "feather-data")
         fs::write_mode(plain, "data\n".bytes(), 0o644).unwrap()
         let search = #["", "/nonexistent", dir]
         assert_eq(super::resolve("feather-tool", search), Some(tool))
