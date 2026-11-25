@@ -60,16 +60,16 @@ mod tests {
     #[test]
     fn stamp_changes_when_an_entry_is_added_edited_or_removed() {
         let root = fs::temp_dir("feather-catalog").unwrap()
-        let apps = path::join(root, "applications")
-        let missing = path::join(root, "missing")
+        let apps = path::join(root, "applications").expect("relative segment")
+        let missing = path::join(root, "missing").expect("relative segment")
         let dirs = #[apps, missing]
-        fs::create_dir_all(path::join(apps, "vendor")).unwrap()
+        fs::create_dir_all(path::join(apps, "vendor").expect("relative segment")).unwrap()
         let empty = super::stamp(dirs)
-        let file = path::join(apps, "vendor/editor.desktop")
+        let file = path::join(apps, "vendor/editor.desktop").expect("relative segment")
         fs::write(file, "[Desktop Entry]\nName=Editor\n".bytes()).unwrap()
         let added = super::stamp(dirs)
         assert(added != empty, "a nested entry counts")
-        fs::write(path::join(apps, "notes.txt"), "ignored".bytes()).unwrap()
+        fs::write(path::join(apps, "notes.txt").expect("relative segment"), "ignored".bytes()).unwrap()
         assert_eq(super::stamp(dirs), added, "other files are ignored")
         fs::write(file, "[Desktop Entry]\nName=Text Editor\n".bytes()).unwrap()
         let edited = super::stamp(dirs)

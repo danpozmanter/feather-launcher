@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn saved_settings_load_back_and_only_changes_are_written() {
         let dir = fs::temp_dir("feather-settings").unwrap()
-        let file = path::join(dir, "settings.json")
+        let file = path::join(dir, "settings.json").expect("relative segment")
         assert_eq(super::load_from(file).unwrap(), super::defaults())
         super::save_to(file, super::defaults()).unwrap()
         let untouched = fs::read_to_string(file).unwrap()

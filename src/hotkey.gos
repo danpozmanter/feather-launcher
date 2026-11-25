@@ -197,11 +197,11 @@ static mut GRAB_FAILED: bool = false
 static mut PREVIOUS_HANDLER: usize = 0
 
 fn handle_x_error(display: Ptr<Display>, error: Ptr<XErrorEvent>) -> ffi::c_int {
-    if display.address() == WATCH_DISPLAY {
-        GRAB_FAILED = true
+    if display.address() == (unsafe { WATCH_DISPLAY }) {
+        unsafe { GRAB_FAILED = true }
         return 0
     }
-    if PREVIOUS_HANDLER != 0 {
+    if (unsafe { PREVIOUS_HANDLER }) != 0 {
         let ptr = unsafe { Ptr::<ffi::c_void>::from_address(PREVIOUS_HANDLER as u64) }.unwrap()
         let handler = unsafe { ffi::fn_from_ptr::<Fn(Ptr<Display>, Ptr<XErrorEvent>) -> ffi::c_int>(ptr) }
         return handler(display, error)
@@ -327,14 +327,14 @@ fn grab_binding(x: X11, text: String) -> Option<(ffi::c_int, ffi::c_uint)> {
     if keycode == 0 { return None }
     let root = x.root()
     let grab_key = x.lib.grab_key
-    GRAB_FAILED = false
+    unsafe { GRAB_FAILED = false }
     for combo in lock_combos() {
         unsafe { grab_key(x.dpy, keycode, mods | combo, root, 0, GRAB_MODE_ASYNC, GRAB_MODE_ASYNC) }
     }
     // XGrabKey reports protocol errors asynchronously. Round-trip before
     // claiming success and undo partial grabs on any modifier combination.
     x.sync()
-    if GRAB_FAILED {
+    if unsafe { GRAB_FAILED } {
         ungrab_binding(x, keycode, mods)
         x.sync()
         return None
@@ -572,8 +572,10 @@ fn watch_x11(mailbox: gui::Mailbox, updates: Receiver<String>, rebind: wake::Wak
     let Some(dpy) = unsafe { open_display(None) } else { return unavailable(mailbox, updates, rebind, shutdown, NO_DISPLAY) }
     let x = X11 { lib: lib, dpy: dpy }
     let set_error_handler = lib.set_error_handler
-    WATCH_DISPLAY = dpy.address()
-    PREVIOUS_HANDLER = unsafe { set_error_handler(ffi::fn_addr(handle_x_error).address() as usize) }
+    unsafe {
+        WATCH_DISPLAY = dpy.address()
+        PREVIOUS_HANDLER = set_error_handler(ffi::fn_addr(handle_x_error).address() as usize)
+    }
     let mut grabbed: Option<(ffi::c_int, ffi::c_uint)> = None
     let result = serve(x, mailbox, updates, rebind, shutdown, initial, &mut grabbed)
     if let Some((keycode, mods)) = grabbed { ungrab_binding(x, keycode, mods) }
@@ -583,7 +585,7 @@ fn watch_x11(mailbox: gui::Mailbox, updates: Receiver<String>, rebind: wake::Wak
         set_error_handler(PREVIOUS_HANDLER)
         close_display(dpy)
     }
-    WATCH_DISPLAY = 0
+    unsafe { WATCH_DISPLAY = 0 }
     result
 }
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.5 - Gossamer 0.85
+
+- Builds on Gossamer 0.85.0 and gui-gos 0.5.3.
+
 ## 0.3.4 - Gossamer 0.81
 
 - Builds on Gossamer 0.81.1 and gui-gos 0.4.0.
