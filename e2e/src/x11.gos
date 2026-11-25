@@ -124,11 +124,13 @@ fn xlib() -> Result<Xlib, errors::Error> {
     }
 }
 
-// Set by `refuse` while `key_grabbed` holds its probe grab.
+// Set by `refuse` while `key_grabbed` holds its probe grab. Xlib calls
+// `refuse` on the thread that syncs, inside `key_grabbed`, so the two never
+// touch it at the same time.
 static mut REFUSED: bool = false
 
 fn refuse(display: Ptr<Display>, error: Ptr<XErrorEvent>) -> ffi::c_int {
-    REFUSED = true
+    unsafe { REFUSED = true }
     0
 }
 
@@ -253,12 +255,12 @@ impl X11 {
         let set_handler = self.lib.set_error_handler
         let grab = self.lib.grab_key
         let ungrab = self.lib.ungrab_key
-        REFUSED = false
+        unsafe { REFUSED = false }
         let previous = unsafe { set_handler(ffi::fn_addr(refuse).address() as usize) }
         let code = self.keycode(keysym) as ffi::c_int
         unsafe { grab(self.display, code, modifiers as ffi::c_uint, self.root as ffi::c_ulong, 0, GRAB_MODE_ASYNC, GRAB_MODE_ASYNC) }
         self.sync()
-        let refused = REFUSED
+        let refused = unsafe { REFUSED }
         if !refused {
             unsafe { ungrab(self.display, code, modifiers as ffi::c_uint, self.root as ffi::c_ulong) }
             self.sync()
